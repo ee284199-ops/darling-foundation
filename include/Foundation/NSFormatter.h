@@ -5,6 +5,21 @@
 @class NSAttributedString;
 @class NSDictionary;
 
+typedef NS_ENUM(NSInteger, NSFormattingContext) {
+    NSFormattingContextUnknown = 0,
+    NSFormattingContextDynamic = 1,
+    NSFormattingContextStandalone = 2,
+    NSFormattingContextListItem = 3,
+    NSFormattingContextBeginningOfSentence = 4,
+    NSFormattingContextMiddleOfSentence = 5,
+};
+
+typedef NS_ENUM(NSInteger, NSFormattingUnitStyle) {
+    NSFormattingUnitStyleShort = 1,
+    NSFormattingUnitStyleMedium,
+    NSFormattingUnitStyleLong,
+};
+
 @interface NSFormatter : NSObject <NSCopying, NSCoding>
 
 - (NSString *)stringForObjectValue:(id)obj;

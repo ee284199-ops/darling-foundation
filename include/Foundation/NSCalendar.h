@@ -46,7 +46,8 @@ enum {
 };
 
 enum {
-    NSUndefinedDateComponent = NSIntegerMax
+    NSUndefinedDateComponent = NSIntegerMax,
+    NSDateComponentUndefined = NSIntegerMax
 };
 
 typedef NSString *NSCalendarIdentifier;
