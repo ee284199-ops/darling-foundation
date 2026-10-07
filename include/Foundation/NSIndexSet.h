@@ -1,28 +1,13 @@
 #import <Foundation/NSObject.h>
 #import <Foundation/NSRange.h>
 
-typedef struct RangeList RangeList;
-typedef struct NSIndexSetCache NSIndexSetCache;
-
-@interface NSIndexSet : NSObject <NSCopying, NSMutableCopying, NSCoding>
+@interface NSIndexSet : NSObject <NSCopying, NSMutableCopying, NSCoding, NSSecureCoding>
 {
 @package
-    struct {
-        unsigned int _isEmpty:1;
-        unsigned int _hasSingleRange:1;
-        unsigned int _cacheValid:1;
-        unsigned int _arrayBinderController:29;
-    } _indexSetFlags;
-    
-    union {
-        struct {
-            NSRange _range;
-        } _singleRange;
-        struct {
-            RangeList *_data;
-            NSIndexSetCache *_cache;
-        } _multipleRanges;
-    } _internal;
+    NSRange *_ranges;        // sorted by location, disjoint and never adjacent (merged)
+    NSUInteger _rangeCount;
+    NSUInteger _capacity;    // allocated NSRange slots
+    NSUInteger _count;       // total number of indexes
 }
 
 + (instancetype)indexSet;
@@ -60,6 +45,7 @@ typedef struct NSIndexSetCache NSIndexSetCache;
 - (void)enumerateRangesWithOptions:(NSEnumerationOptions)opts usingBlock:(void (^)(NSRange range, BOOL *stop))block;
 - (void)enumerateRangesInRange:(NSRange)range options:(NSEnumerationOptions)opts usingBlock:(void (^)(NSRange range, BOOL *stop))block;
 #endif
++ (BOOL)supportsSecureCoding;
 
 @end
 

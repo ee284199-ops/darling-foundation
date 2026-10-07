@@ -2,458 +2,585 @@
 //  NSIndexSet.m
 //  Foundation
 //
-//  Copyright (c) 2014 Apportable. All rights reserved.
+//  Rewritten for the Darling project.
+//
+//  An NSIndexSet stores its indexes in a malloc'ed array of NSRange
+//  structures kept sorted by location. The ranges are disjoint and never
+//  adjacent: every mutation merges ranges that touch, so a set that is
+//  built one index at a time collapses into the fewest possible ranges.
+//  Lookups use binary search over the range array.
+//
+//  Only indexes below NSNotFound are stored, therefore the exclusive end
+//  (location + length) of a stored range never exceeds NSNotFound and can
+//  never overflow a NSUInteger.
 //
 
-#import <stdlib.h>
-#import <Foundation/NSString.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
 #import <Foundation/NSIndexSet.h>
+#import <Foundation/NSString.h>
 #import <Foundation/NSException.h>
 #import <Foundation/NSCoder.h>
-#import <Foundation/NSMutableData.h>
-#import <CoreFoundation/CFArray.h>
-#import <dispatch/dispatch.h>
-#import "utlist.h"
+#import <Foundation/NSData.h>
 
-typedef struct RangeList {
-    NSRange range;
-    struct RangeList *next;
-    struct RangeList *prev;
-} RangeList;
+typedef void (^IndexSetEnumerateBlock)(NSUInteger idx, BOOL *stop);
+typedef BOOL (^IndexSetPredicateBlock)(NSUInteger idx, BOOL *stop);
+typedef void (^IndexSetRangeBlock)(NSRange range, BOOL *stop);
 
-typedef struct NSIndexSetCache {
-    CFArrayRef ranges;
-    NSUInteger count;
-    NSUInteger rangeCount;
-} NSIndexSetCache;
+@interface NSIndexSet ()
 
-static BOOL NSContainsRange(NSRange haystack, NSRange needle)
+- (NSUInteger)rangeCount;
+- (void)_enumerateIndexesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(IndexSetEnumerateBlock)block;
+- (NSUInteger)_indexInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate;
+- (NSIndexSet *)_indexesInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate;
+- (void)_enumerateRangesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(IndexSetRangeBlock)block;
+
+@end
+
+// Exclusive end of a stored range. Never overflows, see file comment.
+static NSUInteger NSIndexSetRangeEnd(NSRange range)
 {
-    return haystack.location <= needle.location && NSMaxRange(needle) <= NSMaxRange(haystack);
+    return range.location + range.length;
 }
 
-#define FLAGS(set) (set->_indexSetFlags)
-#define INTERNAL(set) (set->_internal)
-#define MULTIPLE_RANGES(set) INTERNAL(set)._multipleRanges
-
-#define IS_EMPTY(set) (FLAGS(set)._isEmpty)
-#define SET_EMPTY(set, val) (FLAGS(set)._isEmpty = val)
-
-#define HAS_SINGLE_RANGE(set) (FLAGS(set)._hasSingleRange)
-#define SET_HAS_SINGLE_RANGE(set, val) (FLAGS(set)._hasSingleRange = val)
-
-#define CACHE_VALID(set) (FLAGS(set)._cacheValid)
-#define SET_CACHE_VALID(set, val) (FLAGS(set)._cacheValid = val)
-
-#define CACHE(set) (MULTIPLE_RANGES(set)._cache)
-#define SET_CACHE(set, value) MULTIPLE_RANGES(set)._cache = value
-
-#define MULTIPLE_RANGE_DATA(set) MULTIPLE_RANGES(set)._data
-#define SET_MULTIPLE_RANGE_DATA(set, val) MULTIPLE_RANGES(set)._data = val
-
-#define SINGLE_RANGE(set) (INTERNAL(set)._singleRange._range)
-
-#define SET_SINGLE_RANGE(set, range) SINGLE_RANGE(set) = range
-
-#define RESET_CACHE(set) \
-SET_CACHE_VALID(set, NO); \
-SET_CACHE(set, NULL)
-
-#define CLEAR_CACHE(set) if (!HAS_SINGLE_RANGE(set) && CACHE_VALID(set)) { \
-    NSIndexSetPurgeCache((NSIndexSetCache *)CACHE(set)); \
-    RESET_CACHE(set); \
-}
-
-#define CLEAR_RANGES(set) if (!IS_EMPTY(set)) { \
-    if (HAS_SINGLE_RANGE(set)) { \
-        SET_HAS_SINGLE_RANGE(set, NO); \
-    } else { \
-        CLEAR_CACHE(set); \
-    } \
-    SET_EMPTY(set, YES); \
-}
-
-#define BUILD_CACHE(set) ({ \
-    if (!HAS_SINGLE_RANGE(set) && !CACHE_VALID(set)) { \
-        NSIndexSetBuildCache(&CACHE(set), MULTIPLE_RANGE_DATA(set)); \
-    } \
-    BOOL __valid = !HAS_SINGLE_RANGE(set) && CACHE_VALID(set); \
-    __valid; \
-})
-
-
-@implementation NSIndexSet
-
-static inline void NSIndexSetPurgeCache(NSIndexSetCache *cache)
+// Exclusive end of an arbitrary caller-supplied range, capped at NSNotFound.
+static NSUInteger NSIndexSetRangeBound(NSRange range)
 {
-    if (cache == NULL)
+    if (range.location >= NSNotFound)
+    {
+        return NSNotFound;
+    }
+    if (range.length >= NSNotFound - range.location)
+    {
+        return NSNotFound;
+    }
+    return range.location + range.length;
+}
+
+static BOOL NSIndexSetRangeIsValid(NSRange range)
+{
+    return range.location <= NSNotFound && range.length <= NSNotFound - range.location;
+}
+
+static void NSIndexSetEnsureCapacity(NSIndexSet *self, NSUInteger needed)
+{
+    if (self->_capacity >= needed)
     {
         return;
     }
-    
-    CFRelease(cache->ranges);
-    
-    free(cache);
+
+    NSUInteger newCapacity = self->_capacity > 0 ? self->_capacity : 4;
+    while (newCapacity < needed)
+    {
+        if (newCapacity > ((NSUInteger)-1) / (2 * sizeof(NSRange)))
+        {
+            newCapacity = needed;
+            break;
+        }
+        newCapacity *= 2;
+    }
+
+    NSRange *newRanges = (NSRange *)realloc(self->_ranges, newCapacity * sizeof(NSRange));
+    if (newRanges == NULL)
+    {
+        [NSException raise:NSMallocException format:@"Unable to grow NSIndexSet range storage"];
+    }
+    self->_ranges = newRanges;
+    self->_capacity = newCapacity;
 }
 
-static inline void NSIndexSetBuildCache(NSIndexSetCache **cache, RangeList *ranges)
+// First slot whose exclusive end is >= value (self->_rangeCount if none).
+static NSUInteger NSIndexSetFindRangeWithEndAtLeast(NSIndexSet *self, NSUInteger value)
 {
-    *cache = malloc(sizeof(NSIndexSetCache));
-    if (*cache == NULL)
+    NSUInteger low = 0;
+    NSUInteger high = self->_rangeCount;
+    while (low < high)
     {
-        return;
-    }
-    
-#define STACK_SIZE 32
-    
-    RangeList *stack_values[STACK_SIZE] = {0};
-    RangeList **values = &stack_values[0];
-    RangeList *entry = NULL;
-    NSUInteger rangeCount = 0;
-    NSUInteger count = 0;
-    NSUInteger capacity = 0;
-    
-    DL_FOREACH(ranges, entry)
-    {
-        if (rangeCount > STACK_SIZE && values == &stack_values[0])
+        NSUInteger mid = low + (high - low) / 2;
+        if (NSIndexSetRangeEnd(self->_ranges[mid]) >= value)
         {
-            values = malloc(capacity * sizeof(RangeList *));
-            if (values == NULL)
-            {
-                free(*cache);
-                *cache = NULL;
-                return;
-            }
+            high = mid;
         }
-        else if (rangeCount > STACK_SIZE && rangeCount + 1 > capacity)
+        else
         {
-            capacity *= 2;
-            values = reallocf(values, capacity * sizeof(RangeList *));
-            if (values == NULL) // prev values cleaned up by reallocf
-            {
-                free(*cache);
-                *cache = NULL;
-                return;
-            }
+            low = mid + 1;
         }
-        
-        values[rangeCount] = entry;
-        count += entry->range.length;
-        
-        rangeCount++;
     }
-    
-    static const CFArrayCallBacks callbacks = {
-        .retain = NULL,
-        .release = NULL,
-    };
-    
-    (*cache)->ranges = CFArrayCreate(kCFAllocatorDefault, (const void **)values, rangeCount, &callbacks);
-    (*cache)->rangeCount = rangeCount;
-    
-    if (values != &stack_values[0] && values != NULL)
-    {
-        free(values);
-    }
+    return low;
 }
 
-static inline void addIndexesInRange(NSIndexSet *self, NSRange range)
+// First slot whose exclusive end is > value (self->_rangeCount if none).
+static NSUInteger NSIndexSetFindRangeWithEndGreaterThan(NSIndexSet *self, NSUInteger value)
 {
-    NSUInteger start = range.location;
-    NSUInteger end = start + range.length;
-    
+    NSUInteger low = 0;
+    NSUInteger high = self->_rangeCount;
+    while (low < high)
+    {
+        NSUInteger mid = low + (high - low) / 2;
+        if (NSIndexSetRangeEnd(self->_ranges[mid]) > value)
+        {
+            high = mid;
+        }
+        else
+        {
+            low = mid + 1;
+        }
+    }
+    return low;
+}
+
+// First slot whose location is >= value (self->_rangeCount if none).
+static NSUInteger NSIndexSetFindRangeWithLocationAtLeast(NSIndexSet *self, NSUInteger value)
+{
+    NSUInteger low = 0;
+    NSUInteger high = self->_rangeCount;
+    while (low < high)
+    {
+        NSUInteger mid = low + (high - low) / 2;
+        if (self->_ranges[mid].location >= value)
+        {
+            high = mid;
+        }
+        else
+        {
+            low = mid + 1;
+        }
+    }
+    return low;
+}
+
+// First slot whose location is > value (self->_rangeCount if none).
+static NSUInteger NSIndexSetFindRangeWithLocationGreaterThan(NSIndexSet *self, NSUInteger value)
+{
+    NSUInteger low = 0;
+    NSUInteger high = self->_rangeCount;
+    while (low < high)
+    {
+        NSUInteger mid = low + (high - low) / 2;
+        if (self->_ranges[mid].location > value)
+        {
+            high = mid;
+        }
+        else
+        {
+            low = mid + 1;
+        }
+    }
+    return low;
+}
+
+static void NSIndexSetAddRange(NSIndexSet *self, NSRange range)
+{
     if (range.length == 0)
     {
         return;
     }
-    else if (IS_EMPTY(self))
+    if (!NSIndexSetRangeIsValid(range))
     {
-        SET_HAS_SINGLE_RANGE(self, YES);
-        SET_EMPTY(self, NO);
-        SET_SINGLE_RANGE(self, range);
+        [NSException raise:NSRangeException format:@"range {%lu, %lu} extends past NSNotFound",
+            (unsigned long)range.location, (unsigned long)range.length];
+    }
+
+    NSUInteger start = range.location;
+    NSUInteger end = range.location + range.length;
+
+    NSUInteger first = NSIndexSetFindRangeWithEndAtLeast(self, start);
+    NSUInteger last = NSIndexSetFindRangeWithLocationGreaterThan(self, end);
+
+    if (first == last)
+    {
+        NSIndexSetEnsureCapacity(self, self->_rangeCount + 1);
+        if (self->_rangeCount > first)
+        {
+            memmove(&self->_ranges[first + 1], &self->_ranges[first], (self->_rangeCount - first) * sizeof(NSRange));
+        }
+        self->_ranges[first] = NSMakeRange(start, end - start);
+        self->_rangeCount++;
+        self->_count += end - start;
         return;
     }
-    else if (HAS_SINGLE_RANGE(self))
+
+    NSUInteger covered = 0;
+    for (NSUInteger i = first; i < last; i++)
     {
-        NSUInteger rangeStart = SINGLE_RANGE(self).location;
-        NSUInteger rangeEnd = rangeStart + SINGLE_RANGE(self).length;
-        
-        if (rangeEnd == start) //adjoining, merge and extend
+        covered += self->_ranges[i].length;
+    }
+
+    NSUInteger newStart = MIN(start, self->_ranges[first].location);
+    NSUInteger newEnd = MAX(end, NSIndexSetRangeEnd(self->_ranges[last - 1]));
+    self->_ranges[first] = NSMakeRange(newStart, newEnd - newStart);
+
+    if (last - first > 1)
+    {
+        if (self->_rangeCount > last)
         {
-            SET_SINGLE_RANGE(self, NSMakeRange(SINGLE_RANGE(self).location, SINGLE_RANGE(self).length + range.length));
+            memmove(&self->_ranges[first + 1], &self->_ranges[last], (self->_rangeCount - last) * sizeof(NSRange));
+        }
+        self->_rangeCount -= last - first - 1;
+    }
+    self->_count += (newEnd - newStart) - covered;
+}
+
+static void NSIndexSetRemoveRange(NSIndexSet *self, NSRange range)
+{
+    if (range.length == 0)
+    {
+        return;
+    }
+    if (!NSIndexSetRangeIsValid(range))
+    {
+        [NSException raise:NSRangeException format:@"range {%lu, %lu} extends past NSNotFound",
+            (unsigned long)range.location, (unsigned long)range.length];
+    }
+    if (self->_rangeCount == 0)
+    {
+        return;
+    }
+
+    NSUInteger start = range.location;
+    NSUInteger end = range.location + range.length;
+
+    NSUInteger first = NSIndexSetFindRangeWithEndGreaterThan(self, start);
+    NSUInteger last = NSIndexSetFindRangeWithLocationAtLeast(self, end);
+    if (first >= last)
+    {
+        return;
+    }
+
+    NSUInteger oldRangeCount = self->_rangeCount;
+    // At most one range can be split in two.
+    NSRange *result = (NSRange *)malloc((oldRangeCount + 1) * sizeof(NSRange));
+    if (result == NULL)
+    {
+        [NSException raise:NSMallocException format:@"Unable to grow NSIndexSet range storage"];
+    }
+
+    NSUInteger count = 0;
+    NSUInteger newCount = self->_count;
+
+    for (NSUInteger i = 0; i < first; i++)
+    {
+        result[count++] = self->_ranges[i];
+    }
+
+    for (NSUInteger i = first; i < last; i++)
+    {
+        NSRange entry = self->_ranges[i];
+        NSUInteger entryEnd = NSIndexSetRangeEnd(entry);
+        NSUInteger overlapStart = MAX(entry.location, start);
+        NSUInteger overlapEnd = MIN(entryEnd, end);
+
+        if (start <= entry.location)
+        {
+            if (end >= entryEnd)
+            {
+                // The whole range was removed.
+                newCount -= entry.length;
+                continue;
+            }
+            // The head of the range was removed.
+            newCount -= overlapEnd - entry.location;
+            result[count++] = NSMakeRange(end, entryEnd - end);
+        }
+        else if (end >= entryEnd)
+        {
+            // The tail of the range was removed.
+            newCount -= entryEnd - overlapStart;
+            result[count++] = NSMakeRange(entry.location, overlapStart - entry.location);
+        }
+        else
+        {
+            // The middle of the range was removed: split it in two.
+            newCount -= overlapEnd - overlapStart;
+            result[count++] = NSMakeRange(entry.location, overlapStart - entry.location);
+            result[count++] = NSMakeRange(end, entryEnd - end);
+        }
+    }
+
+    for (NSUInteger i = last; i < oldRangeCount; i++)
+    {
+        result[count++] = self->_ranges[i];
+    }
+
+    free(self->_ranges);
+    self->_ranges = result;
+    self->_rangeCount = count;
+    self->_capacity = oldRangeCount + 1;
+    self->_count = newCount;
+}
+
+typedef struct {
+    NSRange *ranges;
+    NSUInteger count;
+    NSUInteger capacity;
+} NSIndexSetBuilder;
+
+static void NSIndexSetBuilderAppend(NSIndexSetBuilder *builder, NSRange range)
+{
+    if (range.length == 0)
+    {
+        return;
+    }
+
+    if (builder->count > 0)
+    {
+        NSRange *last = &builder->ranges[builder->count - 1];
+        if (NSIndexSetRangeEnd(*last) >= range.location)
+        {
+            NSUInteger end = MAX(NSIndexSetRangeEnd(*last), NSIndexSetRangeEnd(range));
+            last->length = end - last->location;
             return;
         }
-        if ((start <= rangeStart && rangeEnd <= end) ||
-            (rangeStart <= start && start <= rangeEnd && rangeEnd <= end) ||
-            (start <= rangeStart && rangeStart <= end && end <= rangeEnd))
-        {
-            SET_SINGLE_RANGE(self, NSMakeRange(MIN(start, rangeStart), MAX(end, rangeEnd) - MIN(start, rangeStart)));
-            return;
-        }
-        RangeList *oldRange = malloc(sizeof(RangeList));
-        oldRange->range = SINGLE_RANGE(self);
-        
-        RangeList *newRange = malloc(sizeof(RangeList));
-        newRange->range = range;
-        
-        SET_HAS_SINGLE_RANGE(self, NO);
-        MULTIPLE_RANGE_DATA(self) = NULL;
-        
-        // set the cache to NULL so that it does not have junk data from the union
-        RESET_CACHE(self);
-        
-        if (oldRange->range.location < newRange->range.location)
-        {
-            DL_APPEND(MULTIPLE_RANGE_DATA(self), oldRange);
-            DL_APPEND(MULTIPLE_RANGE_DATA(self), newRange);
-        }
-        else
-        {
-            DL_APPEND(MULTIPLE_RANGE_DATA(self), newRange);
-            DL_APPEND(MULTIPLE_RANGE_DATA(self), oldRange);
-        }
     }
-    else
+
+    if (builder->count == builder->capacity)
     {
-        // clear the cache
-        CLEAR_CACHE(self);
-        
-        RangeList *newRange = malloc(sizeof(RangeList));
-        newRange->range = range;
-        
-        RangeList *ptr = [self _pointerToRangeBeforeOrContainingIndex:range.location];
-        if (ptr == NULL)
+        NSUInteger newCapacity = builder->capacity > 0 ? builder->capacity * 2 : 8;
+        NSRange *newRanges = (NSRange *)realloc(builder->ranges, newCapacity * sizeof(NSRange));
+        if (newRanges == NULL)
         {
-            DL_PREPEND(MULTIPLE_RANGE_DATA(self), newRange);
+            [NSException raise:NSMallocException format:@"Unable to grow NSIndexSet range storage"];
         }
-        else if (NSContainsRange(ptr->range, range))
-        {
-            return;
-        }
-        else
-        {
-            DL_INSERT(MULTIPLE_RANGE_DATA(self), ptr, newRange);
-        }
-        
-        [self _mergeOverlappingRangesStartingAtIndex:(ptr ?: MULTIPLE_RANGE_DATA(self))];
+        builder->ranges = newRanges;
+        builder->capacity = newCapacity;
     }
+    builder->ranges[builder->count++] = range;
 }
 
-static inline CFComparisonResult NSIndexSetCompareEntry(RangeList *r1, RangeList *r2, RangeList *search)
+static void NSIndexSetAppendVarint(uint8_t *bytes, NSUInteger *offset, uint64_t value)
 {
-    RangeList *needle = NULL;
-    RangeList *haystack = NULL;
-    
-    if (r1 == search)
+    do
     {
-        needle = r1;
-        haystack = r2;
-    }
-    else if (r2 == search)
-    {
-        needle = r2;
-        haystack = r1;
-    }
-    else
-    {
-        if (r1->range.location < r2->range.location)
+        uint8_t byte = (uint8_t)(value & 0x7F);
+        value >>= 7;
+        if (value != 0)
         {
-            return kCFCompareLessThan;
+            byte |= 0x80;
         }
-        else if (r1->range.location > r2->range.location)
-        {
-            return kCFCompareGreaterThan;
-        }
-        else
-        {
-            return kCFCompareEqualTo;
-        }
-    }
-    
-    if (haystack->range.location <= needle->range.location + needle->range.length && needle->range.location + needle->range.length <= haystack->range.location + haystack->range.length)
-    {
-        return kCFCompareEqualTo;
-    }
-    else if (needle->range.location < haystack->range.location)
-    {
-        if (needle == r1)
-        {
-            return kCFCompareLessThan;
-        }
-        else
-        {
-            return kCFCompareGreaterThan;
-        }
-    }
-    else if (needle->range.location > haystack->range.location)
-    {
-        if (needle == r1)
-        {
-            return kCFCompareGreaterThan;
-        }
-        else
-        {
-            return kCFCompareLessThan;
-        }
-    }
-    
-    NSCAssert(0, @"Incorrect searching logic");
-    return kCFCompareEqualTo; // error in logic if we get to here?
+        bytes[(*offset)++] = byte;
+    } while (value != 0);
 }
 
-- (BOOL)_isEmpty
+static BOOL NSIndexSetDecodeVarint(const uint8_t *bytes, NSUInteger length, NSUInteger *offset, uint64_t *outValue)
 {
-    return IS_EMPTY(self);
+    uint64_t value = 0;
+    unsigned shift = 0;
+    NSUInteger position = *offset;
+
+    while (position < length)
+    {
+        uint8_t byte = bytes[position++];
+        if (shift > 63)
+        {
+            return NO;
+        }
+        value |= (uint64_t)(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0)
+        {
+            *offset = position;
+            *outValue = value;
+            return YES;
+        }
+        shift += 7;
+    }
+
+    return NO;
 }
 
-- (BOOL)_hasSingleRange
+@implementation NSIndexSet
+
++ (BOOL)supportsSecureCoding
 {
-    return HAS_SINGLE_RANGE(self);
+    return YES;
 }
 
-- (NSRange)_singleRange
-{
-    return SINGLE_RANGE(self);
-}
-
-- (RangeList *)_multipleRangeData
-{
-    return MULTIPLE_RANGE_DATA(self);
-}
-
-+ (id)indexSet
++ (instancetype)indexSet
 {
     return [[[self alloc] init] autorelease];
 }
 
-+ (id)indexSetWithIndex:(NSUInteger)value
++ (instancetype)indexSetWithIndex:(NSUInteger)value
 {
-    return [[[self alloc] initWithIndexesInRange:NSMakeRange(value,1)] autorelease];
+    return [[[self alloc] initWithIndex:value] autorelease];
 }
 
-+ (id)indexSetWithIndexesInRange:(NSRange)range
++ (instancetype)indexSetWithIndexesInRange:(NSRange)range
 {
     return [[[self alloc] initWithIndexesInRange:range] autorelease];
 }
 
-- (id)init
+- (instancetype)init
 {
-    return [self initWithIndexesInRange:NSMakeRange(0,0)];
+    return [self initWithIndexesInRange:NSMakeRange(0, 0)];
 }
 
-- (id)_init
-{
-    self = [super init];
-    if (self)
-    {
-        CLEAR_RANGES(self);
-    }
-    return self;
-}
-
-- (id)initWithIndex:(NSUInteger)value
+- (instancetype)initWithIndex:(NSUInteger)value
 {
     return [self initWithIndexesInRange:NSMakeRange(value, 1)];
 }
 
-- (id)initWithIndexSet:(NSIndexSet *)indexSet
+- (instancetype)initWithIndexesInRange:(NSRange)range
 {
-    [self _init];
-    if (self)
+    self = [super init];
+    if (self != nil)
     {
-        [self _setContentToContentFromIndexSet:indexSet];
+        NSIndexSetAddRange(self, range);
     }
     return self;
 }
 
-- (id)initWithIndexesInRange:(NSRange)range
+- (instancetype)initWithIndexSet:(NSIndexSet *)indexSet
 {
-    [self _init];
-    if (self)
+    self = [super init];
+    if (self != nil && indexSet != nil && indexSet->_rangeCount > 0)
     {
-        if (range.length > 0)
-        {
-            addIndexesInRange(self, range);
-        }
+        NSIndexSetEnsureCapacity(self, indexSet->_rangeCount);
+        memcpy(self->_ranges, indexSet->_ranges, indexSet->_rangeCount * sizeof(NSRange));
+        self->_rangeCount = indexSet->_rangeCount;
+        self->_count = indexSet->_count;
     }
     return self;
 }
 
-- (void) encodeWithCoder: (NSCoder*)aCoder
+- (instancetype)initWithCoder:(NSCoder *)coder
 {
-    if ([aCoder allowsKeyedCoding])
+    self = [super init];
+    if (self == nil)
     {
-        NSUInteger count = [self rangeCount];
-        [aCoder encodeInt64:count forKey:@"NSRangeCount"];
-        if (count == 1)
-        {
-            [aCoder encodeInt64:SINGLE_RANGE(self).location forKey:@"NSLocation"];
-            [aCoder encodeInt64:SINGLE_RANGE(self).length forKey:@"NSLength"];
-        }
-        else if (count > 1)
-        {
-            NSMutableData *data = [[NSMutableData alloc] init];
-            RangeList *ptr = NULL;
-            DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-            {
-                [data appendBytes:&ptr->range.location length:sizeof(NSUInteger)];
-                [data appendBytes:&ptr->range.length length:sizeof(NSUInteger)];
-            }
-            [aCoder encodeObject:data forKey:@"NSRangeData"];
-        }
+        return nil;
     }
-    else 
-    {
-        #warning TODO : implement support for non keyed archives
-    }
-}
 
-- (id)initWithCoder:(NSCoder *)coder {
     if ([coder allowsKeyedCoding])
     {
-        NSUInteger count = [coder decodeInt64ForKey:@"NSRangeCount"];
-        if (count == 1)
+        int64_t rangeCount = 0;
+        if ([coder containsValueForKey:@"NSRangeCount"])
         {
-            NSRange range = NSMakeRange([coder decodeInt64ForKey:@"NSLocation"], [coder decodeInt64ForKey:@"NSLength"]);
-            return [self initWithIndexesInRange:range];
+            rangeCount = [coder decodeInt64ForKey:@"NSRangeCount"];
         }
-        else if (count > 1)
+
+        if (rangeCount == 1)
         {
-            [self _init];
-            if (self)
+            int64_t location = 0;
+            int64_t length = 0;
+            if ([coder containsValueForKey:@"NSLocation"])
             {
-                NSData *data = [coder decodeObjectForKey:@"NSRangeData"];
-                // increase the by two since ranges always come in pair
-                for (int i = 1; i <= count; i = i+2)
-                {
-                    NSUInteger location;
-                    [data getBytes:&location length:sizeof(NSUInteger)];
-                    NSUInteger length;
-                    [data getBytes:&length length:sizeof(NSUInteger)];
-                    addIndexesInRange(self, NSMakeRange(location, length));
-                }  
+                location = [coder decodeInt64ForKey:@"NSLocation"];
             }
-            return self;
+            if ([coder containsValueForKey:@"NSLength"])
+            {
+                length = [coder decodeInt64ForKey:@"NSLength"];
+            }
+            if (location >= 0 && length >= 0 &&
+                (uint64_t)location <= NSNotFound && (uint64_t)length <= NSNotFound &&
+                (uint64_t)location + (uint64_t)length <= NSNotFound)
+            {
+                NSIndexSetAddRange(self, NSMakeRange((NSUInteger)location, (NSUInteger)length));
+            }
         }
-        else
+        else if (rangeCount > 1)
         {
-            return [self init];
+            NSData *data = [coder decodeObjectForKey:@"NSRangeData"];
+            if (data != nil)
+            {
+                const uint8_t *bytes = [data bytes];
+                NSUInteger dataLength = [data length];
+                NSUInteger offset = 0;
+
+                for (int64_t i = 0; i < rangeCount; i++)
+                {
+                    uint64_t location = 0;
+                    uint64_t length = 0;
+                    if (!NSIndexSetDecodeVarint(bytes, dataLength, &offset, &location))
+                    {
+                        break;
+                    }
+                    if (!NSIndexSetDecodeVarint(bytes, dataLength, &offset, &length))
+                    {
+                        break;
+                    }
+                    if (location <= NSNotFound && length <= NSNotFound && location + length <= NSNotFound)
+                    {
+                        NSIndexSetAddRange(self, NSMakeRange((NSUInteger)location, (NSUInteger)length));
+                    }
+                }
+            }
         }
     }
-    else 
+    else
     {
-        #warning TODO : implement support for non keyed archives
-        return self;
+        NSUInteger rangeCount = 0;
+        [coder decodeValueOfObjCType:@encode(NSUInteger) at:&rangeCount];
+        for (NSUInteger i = 0; i < rangeCount; i++)
+        {
+            NSUInteger location = 0;
+            NSUInteger length = 0;
+            [coder decodeValueOfObjCType:@encode(NSUInteger) at:&location];
+            [coder decodeValueOfObjCType:@encode(NSUInteger) at:&length];
+            if (NSIndexSetRangeIsValid(NSMakeRange(location, length)))
+            {
+                NSIndexSetAddRange(self, NSMakeRange(location, length));
+            }
+        }
+    }
+
+    return self;
+}
+
+- (void)encodeWithCoder:(NSCoder *)aCoder
+{
+    NSUInteger rangeCount = self->_rangeCount;
+
+    if ([aCoder allowsKeyedCoding])
+    {
+        [aCoder encodeInt64:(int64_t)rangeCount forKey:@"NSRangeCount"];
+
+        if (rangeCount == 1)
+        {
+            [aCoder encodeInt64:(int64_t)self->_ranges[0].location forKey:@"NSLocation"];
+            [aCoder encodeInt64:(int64_t)self->_ranges[0].length forKey:@"NSLength"];
+        }
+        else if (rangeCount > 1)
+        {
+            // Each value needs at most 10 bytes.
+            uint8_t *bytes = (uint8_t *)malloc(rangeCount * (2 * 10) + 1);
+            if (bytes == NULL)
+            {
+                [NSException raise:NSMallocException format:@"Unable to encode NSIndexSet ranges"];
+            }
+            NSUInteger length = 0;
+            for (NSUInteger i = 0; i < rangeCount; i++)
+            {
+                NSIndexSetAppendVarint(bytes, &length, (uint64_t)self->_ranges[i].location);
+                NSIndexSetAppendVarint(bytes, &length, (uint64_t)self->_ranges[i].length);
+            }
+            NSData *data = [[NSData alloc] initWithBytes:bytes length:length];
+            free(bytes);
+            [aCoder encodeObject:data forKey:@"NSRangeData"];
+            [data release];
+        }
+    }
+    else
+    {
+        [aCoder encodeValueOfObjCType:@encode(NSUInteger) at:&rangeCount];
+        for (NSUInteger i = 0; i < rangeCount; i++)
+        {
+            NSUInteger location = self->_ranges[i].location;
+            NSUInteger length = self->_ranges[i].length;
+            [aCoder encodeValueOfObjCType:@encode(NSUInteger) at:&location];
+            [aCoder encodeValueOfObjCType:@encode(NSUInteger) at:&length];
+        }
     }
 }
 
 - (BOOL)isEqual:(id)other
 {
-    if (self == other)
+    if (other == self)
     {
         return YES;
     }
-    if (![other isKindOfClass:[NSIndexSet class]])
+    if (other == nil || ![other isKindOfClass:[NSIndexSet class]])
     {
         return NO;
     }
@@ -462,535 +589,281 @@ static inline CFComparisonResult NSIndexSetCompareEntry(RangeList *r1, RangeList
 
 - (BOOL)isEqualToIndexSet:(NSIndexSet *)indexSet
 {
-   
-    NSUInteger idx1 = [self firstIndex];
-    NSUInteger idx2 = [indexSet firstIndex];
-    
-    do {
-        if (idx1 != idx2)
+    if (indexSet == self)
+    {
+        return YES;
+    }
+    if (indexSet == nil || self->_rangeCount != indexSet->_rangeCount || self->_count != indexSet->_count)
+    {
+        return NO;
+    }
+    if (self->_rangeCount == 0)
+    {
+        return YES;
+    }
+    return memcmp(self->_ranges, indexSet->_ranges, self->_rangeCount * sizeof(NSRange)) == 0;
+}
+
+- (NSUInteger)hash
+{
+    return self->_count ^ [self firstIndex];
+}
+
+- (NSString *)description
+{
+    NSMutableString *indexes = [NSMutableString string];
+
+    for (NSUInteger i = 0; i < self->_rangeCount; i++)
+    {
+        NSRange range = self->_ranges[i];
+        if (i > 0)
         {
-            return NO;
+            [indexes appendString:@" "];
         }
-        idx1 = [self indexGreaterThanIndex:idx1];
-        idx2 = [indexSet indexGreaterThanIndex:idx2];
-    } while (idx1 != NSNotFound && idx2 != NSNotFound);
-    
-    return idx1 == idx2;
+        if (range.length == 1)
+        {
+            [indexes appendFormat:@"%lu", (unsigned long)range.location];
+        }
+        else
+        {
+            [indexes appendFormat:@"%lu-%lu", (unsigned long)range.location, (unsigned long)(NSMaxRange(range) - 1)];
+        }
+    }
+
+    return [NSString stringWithFormat:@"<%@: %p>[number of indexes: %lu (in %lu ranges), indexes: (%@)]",
+            NSStringFromClass([self class]), (void *)self,
+            (unsigned long)self->_count, (unsigned long)self->_rangeCount, indexes];
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+    if (![self isKindOfClass:[NSMutableIndexSet class]])
+    {
+        return [self retain];
+    }
+    return [[[NSIndexSet allocWithZone:zone] initWithIndexSet:self] autorelease];
+}
+
+- (id)mutableCopyWithZone:(NSZone *)zone
+{
+    return [[[NSMutableIndexSet allocWithZone:zone] initWithIndexSet:self] autorelease];
+}
+
+- (void)dealloc
+{
+    free(self->_ranges);
+    self->_ranges = NULL;
+    [super dealloc];
 }
 
 - (NSUInteger)count
 {
-    if (IS_EMPTY(self))
-    {
-        return 0;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        return SINGLE_RANGE(self).length;
-    }
-    else if (!BUILD_CACHE(self))
-    {
-        RangeList *ptr = NULL;
-        NSUInteger count = 0;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            count += ptr->range.length;
-        }
-        return count;
-    }
-    else
-    {
-        return CACHE(self)->count;
-    }
+    return self->_count;
 }
 
 - (NSUInteger)rangeCount
 {
-    if (IS_EMPTY(self))
-    {
-        return 0;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        return 1;
-    }
-    else if (!BUILD_CACHE(self))
-    {
-        NSUInteger sum = 0;
-        RangeList *ptr = NULL;
-        DL_COUNT(MULTIPLE_RANGE_DATA(self), ptr, sum);
-        return sum;
-    }
-    else
-    {
-        return CACHE(self)->rangeCount;
-    }
+    return self->_rangeCount;
 }
 
 - (NSUInteger)firstIndex
 {
-    if (IS_EMPTY(self))
+    if (self->_rangeCount == 0)
     {
         return NSNotFound;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        return SINGLE_RANGE(self).location;
-    }
-    
-    return MULTIPLE_RANGE_DATA(self)->range.location;
+    return self->_ranges[0].location;
 }
 
 - (NSUInteger)lastIndex
 {
-    if (IS_EMPTY(self))
+    if (self->_rangeCount == 0)
     {
         return NSNotFound;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        return SINGLE_RANGE(self).location + SINGLE_RANGE(self).length - 1;
-    }
-    
-    RangeList *last = DL_TAIL(MULTIPLE_RANGE_DATA(self));
-    return last->range.location + last->range.length - 1;
+    return NSIndexSetRangeEnd(self->_ranges[self->_rangeCount - 1]) - 1;
 }
 
 - (NSUInteger)indexGreaterThanIndex:(NSUInteger)value
 {
-    if (IS_EMPTY(self))
+    NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, value);
+    if (i >= self->_rangeCount)
     {
         return NSNotFound;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
+
+    NSRange entry = self->_ranges[i];
+    if (entry.location > value)
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        if (value >= end)
-        {
-            return NSNotFound;
-        }
-        else if (value < start)
-        {
-            return start;
-        }
-        else
-        {
-            return value + 1;
-        }
+        return entry.location;
     }
-    else if (!BUILD_CACHE(self))
+    if (value + 1 < NSIndexSetRangeEnd(entry))
     {
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            NSUInteger start = ptr->range.location;
-            NSUInteger end = start + ptr->range.length - 1;
-            if (value < end)
-            {
-                if (value < start)
-                {
-                    return start;
-                }
-                else
-                {
-                    return value + 1;
-                }
-            }
-        }
-        return NSNotFound;
+        return value + 1;
     }
-    else
+    // value was the last index of this range; the answer begins the next one.
+    if (i + 1 < self->_rangeCount)
     {
-        RangeList search = {
-            .range = {
-                .location = value,
-                .length = 0,
-            },
-        };
-        
-        CFIndex found = CFArrayBSearchValues(CACHE(self)->ranges, CFRangeMake(0, CACHE(self)->rangeCount), &search, (CFComparatorFunction)&NSIndexSetCompareEntry, &search);
-        if (found != kCFNotFound)
-        {
-            return value + 1;
-        }
-        
-        return NSNotFound;
+        return self->_ranges[i + 1].location;
     }
+    return NSNotFound;
 }
 
 - (NSUInteger)indexGreaterThanOrEqualToIndex:(NSUInteger)value
 {
-    if (IS_EMPTY(self))
+    NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, value);
+    if (i >= self->_rangeCount)
     {
         return NSNotFound;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
+    if (self->_ranges[i].location > value)
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        if (value > end)
-        {
-            return NSNotFound;
-        }
-        else if (value <= start)
-        {
-            return start;
-        }
-        else
-        {
-            return value;
-        }
+        return self->_ranges[i].location;
     }
-    else if (!BUILD_CACHE(self))
-    {
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            NSUInteger start = ptr->range.location;
-            NSUInteger end = start + ptr->range.length - 1;
-            if (value < end)
-            {
-                if (value <= start)
-                {
-                    return start;
-                }
-                else
-                {
-                    return value;
-                }
-            }
-        }
-        return NSNotFound;
-    }
-    else
-    {
-        RangeList search = {
-            .range = {
-                .location = value,
-                .length = 0,
-            },
-        };
-        
-        CFIndex found = CFArrayBSearchValues(CACHE(self)->ranges, CFRangeMake(0, CACHE(self)->rangeCount), &search, (CFComparatorFunction)&NSIndexSetCompareEntry, &search);
-        if (found != kCFNotFound)
-        {
-            return value;
-        }
-        
-        return NSNotFound;
-    }
+    return value;
 }
 
 - (NSUInteger)indexLessThanIndex:(NSUInteger)value
 {
-    if (IS_EMPTY(self))
+    if (value == 0)
     {
         return NSNotFound;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
+    NSUInteger after = NSIndexSetFindRangeWithLocationAtLeast(self, value);
+    if (after == 0)
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        if (value <= start)
-        {
-            return NSNotFound;
-        }
-        else if (value <= end)
-        {
-            return value - 1;
-        }
-        else
-        {
-            return end;
-        }
-    }
-    else if (!BUILD_CACHE(self))
-    {
-        RangeList *ptr = MULTIPLE_RANGE_DATA(self);
-        if (value <= ptr->range.location)
-        {
-            return NSNotFound;
-        }
-        for (;; ptr = ptr->next)
-        {
-            NSUInteger start = ptr->range.location;
-            NSUInteger end = start + ptr->range.length - 1;
-            if (value <= end)
-            {
-                return value - 1;
-            }
-            if (ptr->next == NULL || value <= ptr->next->range.location)
-            {
-                return end;
-            }
-        }
-    }
-    else
-    {
-        RangeList search = {
-            .range = {
-                .location = value,
-                .length = 1,
-            },
-        };
-        
-        CFIndex found = CFArrayBSearchValues(CACHE(self)->ranges, CFRangeMake(0, CACHE(self)->rangeCount), &search, (CFComparatorFunction)&NSIndexSetCompareEntry, &search);
-        if (found != kCFNotFound)
-        {
-            return value - 1;
-        }
-        
         return NSNotFound;
     }
-    
+    NSRange entry = self->_ranges[after - 1];
+    if (value < NSIndexSetRangeEnd(entry))
+    {
+        return value - 1;
+    }
+    return NSIndexSetRangeEnd(entry) - 1;
 }
 
 - (NSUInteger)indexLessThanOrEqualToIndex:(NSUInteger)value
 {
-    if (IS_EMPTY(self))
+    NSUInteger after = NSIndexSetFindRangeWithLocationGreaterThan(self, value);
+    if (after == 0)
     {
         return NSNotFound;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
+    NSRange entry = self->_ranges[after - 1];
+    if (value < NSIndexSetRangeEnd(entry))
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        if (value < start)
-        {
-            return NSNotFound;
-        }
-        else if (value <= end)
-        {
-            return value;
-        }
-        else
-        {
-            return end;
-        }
+        return value;
     }
-    else if (!BUILD_CACHE(self))
-    {
-        RangeList *ptr = MULTIPLE_RANGE_DATA(self);
-        if (value < ptr->range.location)
-        {
-            return NSNotFound;
-        }
-        for (;; ptr = ptr->next)
-        {
-            NSUInteger start = ptr->range.location;
-            NSUInteger end = start + ptr->range.length - 1;
-            if (value <= end)
-            {
-                return value;
-            }
-            if (ptr->next == NULL || value < ptr->next->range.location)
-            {
-                return end;
-            }
-        }
-    }
-    else
-    {
-        RangeList search = {
-            .range = {
-                .location = value,
-                .length = 1,
-            },
-        };
-        
-        CFIndex found = CFArrayBSearchValues(CACHE(self)->ranges, CFRangeMake(0, CACHE(self)->rangeCount), &search, (CFComparatorFunction)&NSIndexSetCompareEntry, &search);
-        if (found != kCFNotFound)
-        {
-            return value;
-        }
-        
-        return NSNotFound;
-    }
+    return NSIndexSetRangeEnd(entry) - 1;
 }
 
 - (NSUInteger)getIndexes:(NSUInteger *)indexBuffer maxCount:(NSUInteger)bufferSize inIndexRange:(NSRangePointer)range
 {
-    if (IS_EMPTY(self) || bufferSize == 0)
+    NSUInteger clipStart = 0;
+    NSUInteger clipEnd = NSNotFound;
+    if (range != NULL)
     {
-        return 0;
+        clipStart = range->location;
+        clipEnd = NSIndexSetRangeBound(*range);
     }
-    
-    NSUInteger count = 0;
-    NSUInteger startRange = range ? range->location : 0;
-    NSUInteger endRange = range ? (startRange + range->length - 1) : NSUIntegerMax;
-    if (HAS_SINGLE_RANGE(self))
+
+    NSUInteger copied = 0;
+    // "exhausted" means every index of the set inside the range was consumed;
+    // it turns false as soon as we meet an index that does not fit the buffer.
+    BOOL exhausted = YES;
+
+    if (clipStart < clipEnd && self->_rangeCount > 0)
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        
-        if (endRange < start || startRange > end)
+        NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, clipStart);
+        for (; i < self->_rangeCount; i++)
         {
-            return 0;
-        }
-        NSUInteger first = MAX(start, startRange);
-        NSUInteger last = MIN(end, endRange);
-        for (NSUInteger i = first; i <= last; i++)
-        {
-            indexBuffer[count++] = i;
-            if (count == bufferSize)
+            NSRange entry = self->_ranges[i];
+            if (entry.location >= clipEnd)
+            {
+                break;
+            }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            for (NSUInteger index = start; index < end; index++)
+            {
+                if (indexBuffer != NULL && copied < bufferSize)
+                {
+                    indexBuffer[copied++] = index;
+                }
+                else
+                {
+                    exhausted = NO;
+                    break;
+                }
+            }
+            if (!exhausted)
             {
                 break;
             }
         }
-        return count;
     }
-    
-    RangeList *ptr = NULL;
-    DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
+
+    if (range != NULL)
     {
-        NSUInteger start = ptr->range.location;
-        NSUInteger end = start + ptr->range.length - 1;
-        
-        if (endRange < start)
+        if (exhausted)
         {
-            return count;
+            range->location = clipEnd;
+            range->length = 0;
         }
-        if (startRange > end)
+        else
         {
-            continue;
-        }
-        NSUInteger first = MAX(start, startRange);
-        NSUInteger last = MIN(end, endRange);
-        for (NSUInteger i = first; i <= last; i++)
-        {
-            indexBuffer[count++] = i;
-            if (count == bufferSize)
-            {
-                return count;
-            }
+            NSUInteger newLocation = copied > 0 ? indexBuffer[copied - 1] + 1 : clipStart;
+            range->location = newLocation;
+            range->length = newLocation <= clipEnd ? clipEnd - newLocation : 0;
         }
     }
-    return count;
+
+    return copied;
 }
 
 - (NSUInteger)countOfIndexesInRange:(NSRange)range
 {
-    if (IS_EMPTY(self))
+    if (range.length == 0 || self->_rangeCount == 0)
     {
         return 0;
     }
-    
-    NSUInteger startRange = range.location;
-    NSUInteger endRange = startRange + range.length - 1;
-    
-    if (HAS_SINGLE_RANGE(self))
+
+    NSUInteger start = range.location;
+    NSUInteger end = NSIndexSetRangeBound(range);
+    if (start >= end)
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        
-        if (endRange < start || startRange > end)
-        {
-            return 0;
-        }
-        
-        NSUInteger first = MAX(start, startRange);
-        NSUInteger last = MIN(end, endRange);
-        return last - first + 1;
+        return 0;
     }
-    
-    NSUInteger count = 0;
-    
-    RangeList *ptr = NULL;
-    DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
+
+    NSUInteger total = 0;
+    NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, start);
+    for (; i < self->_rangeCount; i++)
     {
-        NSUInteger start = ptr->range.location;
-        NSUInteger end = start + ptr->range.length - 1;
-        
-        if (endRange < start)
+        NSRange entry = self->_ranges[i];
+        if (entry.location >= end)
         {
-            return count;
+            break;
         }
-        if (startRange > end)
-        {
-            continue;
-        }
-        NSUInteger first = MAX(start, startRange);
-        NSUInteger last = MIN(end, endRange);
-        count += last - first + 1;
+        NSUInteger overlapStart = MAX(entry.location, start);
+        NSUInteger overlapEnd = MIN(NSIndexSetRangeEnd(entry), end);
+        total += overlapEnd - overlapStart;
     }
-    
-    return count;
+    return total;
 }
 
 - (BOOL)containsIndex:(NSUInteger)value
 {
-    if (IS_EMPTY(self))
-    {
-        return NO;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        return value >= start && value <= end;
-    }
-    
-    RangeList *ptr = NULL;
-    DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-    {
-        NSUInteger start = ptr->range.location;
-        NSUInteger end = start + ptr->range.length - 1;
-        
-        if (value < start)
-        {
-            return NO;
-        }
-        if (value <= end)
-        {
-            return YES;
-        }
-    }
-    return NO;
+    NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, value);
+    return i < self->_rangeCount && self->_ranges[i].location <= value;
 }
 
 - (BOOL)containsIndexesInRange:(NSRange)range
 {
-    if (IS_EMPTY(self) || range.length == 0)
+    if (range.length == 0)
     {
         return NO;
     }
-    
-    NSUInteger startRange = range.location;
-    NSUInteger endRange = startRange + range.length - 1;
-    if (HAS_SINGLE_RANGE(self))
-    {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        return startRange >= start && endRange <= end;
-    }
-    
-    RangeList *ptr = NULL;
-    
-    DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-    {
-        NSUInteger start = ptr->range.location;
-        NSUInteger end = start + ptr->range.length - 1;
-        
-        if (start > endRange)
-        {
-            break;
-        }
-        if (startRange >= start && endRange <= end)
-        {
-            return YES;
-        }
-    }
-    return NO;
+    return [self countOfIndexesInRange:range] == range.length;
 }
 
 - (BOOL)containsIndexes:(NSIndexSet *)indexSet
@@ -999,932 +872,317 @@ static inline CFComparisonResult NSIndexSetCompareEntry(RangeList *r1, RangeList
     {
         return YES;
     }
-    
-    if (IS_EMPTY(self))
+    for (NSUInteger i = 0; i < indexSet->_rangeCount; i++)
     {
-        return NO;
-    }
-    
-    if ([indexSet _hasSingleRange])
-    {
-        return [self containsIndexesInRange:[indexSet _singleRange]];
-    }
-    
-    for (RangeList *ptr = [indexSet _multipleRangeData]; ptr != NULL; ptr = ptr->next)
-    {
-        if (![self containsIndexesInRange:ptr->range])
+        if (![self containsIndexesInRange:indexSet->_ranges[i]])
         {
             return NO;
         }
     }
-    
     return YES;
 }
+
 - (BOOL)intersectsIndexesInRange:(NSRange)range
 {
-    if (IS_EMPTY(self))
+    if (range.length == 0 || self->_rangeCount == 0)
     {
         return NO;
     }
-    
-    NSUInteger startRange = range.location;
-    NSUInteger endRange = startRange + range.length - 1;
-    
-    if (HAS_SINGLE_RANGE(self))
+
+    NSUInteger start = range.location;
+    NSUInteger end = NSIndexSetRangeBound(range);
+    if (start >= end)
     {
-        NSUInteger start = SINGLE_RANGE(self).location;
-        NSUInteger end = start + SINGLE_RANGE(self).length - 1;
-        return (startRange <= end && endRange >= start);
+        return NO;
     }
-    
-    RangeList *ptr = NULL;
-    DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-    {
-        NSUInteger start = ptr->range.location;
-        NSUInteger end = start + ptr->range.length - 1;
-        
-        if (start > endRange)
-        {
-            break;
-        }
-        if (startRange <= end)
-        {
-            if (endRange >= start)
-            {
-                return YES;
-            }
-        }
-    }
-    return NO;
+
+    NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, start);
+    return i < self->_rangeCount && self->_ranges[i].location < end;
 }
 
-- (id)description
+- (void)_enumerateIndexesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(IndexSetEnumerateBlock)block
 {
-    if (IS_EMPTY(self))
+    NSUInteger clipStart = range.location;
+    NSUInteger clipEnd = NSIndexSetRangeBound(range);
+    if (clipStart >= clipEnd || self->_rangeCount == 0)
     {
-        return @"Empty NSIndexSet";
+        return;
     }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        if (SINGLE_RANGE(self).length == 1)
-        {
-            return  [NSString stringWithFormat:@"index %lu", (unsigned long)SINGLE_RANGE(self).location];
-        }
-        else
-        {
-            return  [NSString stringWithFormat:@"index range %lu through %lu", (unsigned long)SINGLE_RANGE(self).location, (unsigned long)(SINGLE_RANGE(self).location + SINGLE_RANGE(self).length - 1)];
-        }
-    }
-    else
-    {
-        NSMutableString *description = [@"" mutableCopy];
 
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
+    if ((options & NSEnumerationReverse) == 0)
+    {
+        NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, clipStart);
+        for (; i < self->_rangeCount; i++)
         {
-            if (ptr->range.length == 1)
-            {
-                [description appendFormat:@"index %lu -- ", (unsigned long)ptr->range.location];
-            }
-            else
-            {
-                [description appendFormat:@"index range %lu through %lu -- ", (unsigned long)ptr->range.location, (unsigned long)(ptr->range.location + ptr->range.length - 1)];
-            }
-        }
-        return [description autorelease];
-    }
-}
-
-- (id)mutableCopyWithZone:(NSZone*)zone
-{
-    NSMutableIndexSet *copy = [NSMutableIndexSet allocWithZone:zone];
-    return [copy initWithIndexSet:self];
-}
-
-- (id)copyWithZone:(NSZone*)zone
-{
-    NSIndexSet *copy = [NSIndexSet allocWithZone:zone];
-    return [copy initWithIndexSet:self];
-}
-
-- (void)dealloc
-{
-    CLEAR_CACHE(self);
-    
-    if (!IS_EMPTY(self) && !HAS_SINGLE_RANGE(self))
-    {
-        RangeList *ptr = NULL;
-        RangeList *tmp = NULL;
-        
-        DL_FOREACH_SAFE(MULTIPLE_RANGE_DATA(self), ptr, tmp)
-        {
-            free(ptr);
-        }
-        
-        MULTIPLE_RANGE_DATA(self) = NULL;
-    }
-    
-    [super dealloc];
-}
-
-typedef void (^IndexCallback)(NSUInteger, BOOL *);
-
-static void __NSEnumerateSingleIndexRange(NSRange range, NSEnumerationOptions options, IndexCallback block)
-{
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        dispatch_apply(range.length, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                block(iter + range.location, &stop);
-            }
-        });
-    }
-    else if (options & NSEnumerationReverse)
-    {
-        BOOL stop = NO;
-        
-        NSUInteger i = range.location + range.length;
-        while (i > range.location && !stop)
-        {
-            block(i - 1, &stop);
-            i--;
-        }
-    }
-    else
-    {
-        BOOL stop = NO;
-        
-        for (NSUInteger i = range.location; i < range.location + range.length; i++)
-        {
-            block(i, &stop);
-            if (stop)
-            {
-                return;
-            }
-        }
-    }
-}
-
-static void __NSEnumerateMultipleIndexRangesWithNonZeroOptions(NSIndexSet *self, NSRange *range, NSEnumerationOptions options, IndexCallback block)
-{
-    NSUInteger count = [self count];
-    NSUInteger *indexes = (NSUInteger *)malloc(count * sizeof(NSUInteger));
-    NSUInteger actualCount = [self getIndexes:indexes maxCount:count inIndexRange:range];
-    
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        dispatch_apply(actualCount, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                block(indexes[iter], &stop);
-            }
-        });
-    }
-    else // NSEnumerationReverse
-    {
-        BOOL stop = NO;
-        
-        for (NSInteger i = actualCount - 1; i >= 0; i--)
-        {
-            block(indexes[i], &stop);
-            
-            if (stop)
+            NSRange entry = self->_ranges[i];
+            if (entry.location >= clipEnd)
             {
                 break;
             }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            for (NSUInteger index = start; index < end; index++)
+            {
+                BOOL stop = NO;
+                block(index, &stop);
+                if (stop)
+                {
+                    return;
+                }
+            }
         }
     }
-    free(indexes);
+    else
+    {
+        NSUInteger after = NSIndexSetFindRangeWithLocationAtLeast(self, clipEnd);
+        while (after > 0)
+        {
+            NSUInteger i = --after;
+            NSRange entry = self->_ranges[i];
+            if (NSIndexSetRangeEnd(entry) <= clipStart)
+            {
+                break;
+            }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            for (NSUInteger index = end; index-- > start;)
+            {
+                BOOL stop = NO;
+                block(index, &stop);
+                if (stop)
+                {
+                    return;
+                }
+            }
+        }
+    }
 }
 
-- (void)enumerateIndexesUsingBlock:(void (^)(NSUInteger idx, BOOL *stop))block
+- (NSUInteger)_indexInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate
+{
+    NSUInteger clipStart = range.location;
+    NSUInteger clipEnd = NSIndexSetRangeBound(range);
+    if (clipStart >= clipEnd || self->_rangeCount == 0)
+    {
+        return NSNotFound;
+    }
+
+    if ((options & NSEnumerationReverse) == 0)
+    {
+        NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, clipStart);
+        for (; i < self->_rangeCount; i++)
+        {
+            NSRange entry = self->_ranges[i];
+            if (entry.location >= clipEnd)
+            {
+                break;
+            }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            for (NSUInteger index = start; index < end; index++)
+            {
+                BOOL stop = NO;
+                if (predicate(index, &stop))
+                {
+                    return index;
+                }
+                if (stop)
+                {
+                    return NSNotFound;
+                }
+            }
+        }
+    }
+    else
+    {
+        NSUInteger after = NSIndexSetFindRangeWithLocationAtLeast(self, clipEnd);
+        while (after > 0)
+        {
+            NSUInteger i = --after;
+            NSRange entry = self->_ranges[i];
+            if (NSIndexSetRangeEnd(entry) <= clipStart)
+            {
+                break;
+            }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            for (NSUInteger index = end; index-- > start;)
+            {
+                BOOL stop = NO;
+                if (predicate(index, &stop))
+                {
+                    return index;
+                }
+                if (stop)
+                {
+                    return NSNotFound;
+                }
+            }
+        }
+    }
+    return NSNotFound;
+}
+
+- (NSIndexSet *)_indexesInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate
+{
+    NSMutableIndexSet *result = [[NSMutableIndexSet alloc] init];
+    [self _enumerateIndexesInRange:range options:options usingBlock:^(NSUInteger index, BOOL *stop) {
+        if (predicate(index, stop))
+        {
+            [result addIndex:index];
+        }
+    }];
+    return [result autorelease];
+}
+
+- (void)_enumerateRangesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(IndexSetRangeBlock)block
+{
+    NSUInteger clipStart = range.location;
+    NSUInteger clipEnd = NSIndexSetRangeBound(range);
+    if (clipStart >= clipEnd || self->_rangeCount == 0)
+    {
+        return;
+    }
+
+    if ((options & NSEnumerationReverse) == 0)
+    {
+        NSUInteger i = NSIndexSetFindRangeWithEndGreaterThan(self, clipStart);
+        for (; i < self->_rangeCount; i++)
+        {
+            NSRange entry = self->_ranges[i];
+            if (entry.location >= clipEnd)
+            {
+                break;
+            }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            if (start < end)
+            {
+                BOOL stop = NO;
+                block(NSMakeRange(start, end - start), &stop);
+                if (stop)
+                {
+                    return;
+                }
+            }
+        }
+    }
+    else
+    {
+        NSUInteger after = NSIndexSetFindRangeWithLocationAtLeast(self, clipEnd);
+        while (after > 0)
+        {
+            NSUInteger i = --after;
+            NSRange entry = self->_ranges[i];
+            if (NSIndexSetRangeEnd(entry) <= clipStart)
+            {
+                break;
+            }
+            NSUInteger start = MAX(entry.location, clipStart);
+            NSUInteger end = MIN(NSIndexSetRangeEnd(entry), clipEnd);
+            if (start < end)
+            {
+                BOOL stop = NO;
+                block(NSMakeRange(start, end - start), &stop);
+                if (stop)
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+- (void)enumerateIndexesUsingBlock:(IndexSetEnumerateBlock)block
 {
     [self enumerateIndexesWithOptions:0 usingBlock:block];
 }
 
-- (void)enumerateIndexesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(void (^)(NSUInteger idx, BOOL *stop))block
+- (void)enumerateIndexesWithOptions:(NSEnumerationOptions)options usingBlock:(IndexSetEnumerateBlock)block
 {
     if (block == nil)
     {
         [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return;
     }
-    
-    if (IS_EMPTY(self))
-    {
-        return;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        NSRange intersectRange = NSIntersectionRange(range, SINGLE_RANGE(self));
-        if (intersectRange.length == 0)
-        {
-            return;
-        }
-        __NSEnumerateSingleIndexRange(intersectRange, options, block);
-    }
-    else if (options != 0)
-    {
-        __NSEnumerateMultipleIndexRangesWithNonZeroOptions(self, &range, options, block);
-    }
-    else // multiple ranges, zero options
-    {
-        BOOL stop = NO;
-        
-        for (RangeList *ptr = MULTIPLE_RANGE_DATA(self); ptr != NULL; ptr = ptr->next)
-        {
-            if (range.location >= ptr->range.location + ptr->range.length)
-            {
-                continue;
-            }
-            
-            if (ptr->range.location >= range.location + range.length)
-            {
-                break;
-            }
-            
-            NSRange iRange = NSIntersectionRange(range, ptr->range);
-            
-            for (NSUInteger i = iRange.location; i < iRange.location + iRange.length; i++)
-            {
-                block(i, &stop);
-                
-                if (stop)
-                {
-                    return;
-                }
-            }
-        }
-    }
+    [self _enumerateIndexesInRange:NSMakeRange(0, NSNotFound) options:options usingBlock:block];
 }
 
-- (void)enumerateIndexesWithOptions:(NSEnumerationOptions)options usingBlock:(void (^)(NSUInteger idx, BOOL *stop))block
+- (void)enumerateIndexesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(IndexSetEnumerateBlock)block
 {
     if (block == nil)
     {
         [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return;
     }
-    
-    if (IS_EMPTY(self))
-    {
-        return;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        __NSEnumerateSingleIndexRange(SINGLE_RANGE(self), options, block);
-    }
-    else if (options != 0)
-    {
-        __NSEnumerateMultipleIndexRangesWithNonZeroOptions(self, nil, options, block);
-    }
-    else // multiple ranges, zero options
-    {
-        BOOL stop = NO;
-        
-        for (RangeList *ptr = MULTIPLE_RANGE_DATA(self); ptr != NULL; ptr = ptr->next)
-        {
-            for (NSUInteger i = ptr->range.location; i < ptr->range.location + ptr->range.length; i++)
-            {
-                block(i, &stop);
-                
-                if (stop)
-                {
-                    return;
-                }
-            }
-        }
-    }
+    [self _enumerateIndexesInRange:range options:options usingBlock:block];
 }
 
-typedef void (^RangeCallback)(NSRange, BOOL *);
-
-static void __NSEnumerateMultipleRangesWithNonZeroOptions(NSIndexSet *self, NSRange *range, NSEnumerationOptions options, RangeCallback block)
-{
-    NSUInteger count = [self rangeCount];
-    
-    if (count == 0)
-    {
-        return;
-    }
-    
-    NSUInteger actualCount = 0;
-    NSRange *ranges = (NSRange *)malloc(count * sizeof(NSRange));
-    RangeList *ptr = MULTIPLE_RANGE_DATA(self);
-    
-    for (NSUInteger i = 0; i < count; i++, ptr = ptr->next)
-    {
-        if (range)
-        {
-            if (range->location >= ptr->range.location + ptr->range.length)
-            {
-                continue;
-            }
-            if (ptr->range.location >= range->location + range->length)
-            {
-                break;
-            }
-        }
-        ranges[actualCount++] = ptr->range;
-    }
-    
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        dispatch_apply(actualCount, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                block(ranges[iter], &stop);
-            }
-        });
-    }
-    else // NSEnumerationReverse
-    {
-        BOOL stop = NO;
-        for (NSInteger i = actualCount - 1; i >= 0; i--)
-        {
-            block(ranges[i], &stop);
-            
-            if (stop)
-            {
-                break;
-            }
-        }
-    }
-    free(ranges);
-}
-
-- (void)enumerateRangesUsingBlock:(void (^)(NSRange range, BOOL *stop))block
-{
-    [self enumerateRangesWithOptions:0 usingBlock:block];
-}
-
-- (void)enumerateRangesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(void (^)(NSRange range, BOOL *stop))block
-{
-    if (block == nil)
-    {
-        [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return;
-    }
-    
-    if (IS_EMPTY(self))
-    {
-        return;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        BOOL stop = NO;
-        NSRange intersectRange = NSIntersectionRange(range, SINGLE_RANGE(self));
-        if (intersectRange.length == 0)
-        {
-            return;
-        }
-        block(intersectRange, &stop);
-    }
-    else if (options != 0)
-    {
-        __NSEnumerateMultipleRangesWithNonZeroOptions(self, &range, options, block);
-    }
-    else // multiple ranges, zero options
-    {
-        BOOL stop = NO;
-        RangeList *ptr = NULL;
-        RangeList *tmp = NULL;
-        DL_FOREACH_SAFE(MULTIPLE_RANGE_DATA(self), ptr, tmp)
-        {
-            if (range.location >= ptr->range.location + ptr->range.length)
-            {
-                continue;
-            }
-            if (ptr->range.location >= range.location + range.length)
-            {
-                break;
-            }
-            NSRange iRange = NSIntersectionRange(range, ptr->range); // only really necessary on first and last iteration
-            block(iRange, &stop);
-            if (stop)
-            {
-                return;
-            }
-        }
-    }
-}
-
-- (void)enumerateRangesWithOptions:(NSEnumerationOptions)options usingBlock:(void (^)(NSRange range, BOOL *stop))block
-{
-    if (block == nil)
-    {
-        [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return;
-    }
-    
-    if (IS_EMPTY(self))
-    {
-        return;
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        BOOL stop = NO;
-        block(SINGLE_RANGE(self), &stop);
-    }
-    else if (options != 0)
-    {
-        __NSEnumerateMultipleRangesWithNonZeroOptions(self, nil, options, block);
-    }
-    else // multiple ranges, zero options
-    {
-        BOOL stop = NO;
-        RangeList *ptr = NULL;
-        RangeList *tmp = NULL;
-        DL_FOREACH_SAFE(MULTIPLE_RANGE_DATA(self), ptr, tmp)
-        {
-            block(ptr->range, &stop);
-            if (stop)
-            {
-                return;
-            }
-        }
-    }
-}
-
-typedef BOOL (^IndexTest)(NSUInteger, BOOL *);
-
-static NSUInteger __NSEnumerateIndexSingleIndexRange(NSRange range, NSEnumerationOptions options, IndexTest block)
-{
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        __block NSUInteger found = NSNotFound;
-        dispatch_apply(range.length, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                if (block(iter + range.location, &stop))
-                {
-                    found = iter + range.location;
-                    stop = YES;
-                }
-            }
-        });
-        return found;
-    }
-    else if (options & NSEnumerationReverse)
-    {
-        BOOL stop = NO;
-        for (NSInteger i = range.location + range.length - 1 ; i >= range.location; i--)
-        {
-            if (block(i, &stop))
-            {
-                return i;
-            }
-            if (stop)
-            {
-                break;
-            }
-        }
-        return NSNotFound;
-    }
-    else
-    {
-        BOOL stop = NO;
-        for (NSUInteger i = range.location; i < range.location + range.length; i++)
-        {
-            if (block(i, &stop))
-            {
-                return i;
-            }
-            if (stop)
-            {
-                break;
-            }
-        }
-        return NSNotFound;
-    }
-}
-
-static NSUInteger __NSEnumerateIndexMultipleIndexRangesWithNonZeroOptions(NSIndexSet *self, NSRange *range, NSEnumerationOptions options, IndexTest block)
-{
-    NSUInteger count = [self count];
-    NSUInteger *indexes = (NSUInteger *)malloc(count * sizeof(NSUInteger));
-    NSUInteger actualCount = [self getIndexes:indexes maxCount:count inIndexRange:range];
-    __block NSUInteger found = NSNotFound;
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        dispatch_apply(actualCount, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                if (block(indexes[iter], &stop))
-                {
-                    found = indexes[iter];
-                    stop = YES;
-                }
-            }
-        });
-    }
-    else // NSEnumerationReverse
-    {
-        BOOL stop = NO;
-        for (NSInteger i = actualCount - 1; i >= 0; i--)
-        {
-            if (block(indexes[i], &stop))
-            {
-                found = indexes[i];
-                break;
-            }
-            if (stop)
-            {
-                break;
-            }
-        }
-    }
-    free(indexes);
-    return found;
-}
-
-
-- (NSUInteger)indexPassingTest:(BOOL (^)(NSUInteger idx, BOOL *stop))predicate
+- (NSUInteger)indexPassingTest:(IndexSetPredicateBlock)predicate
 {
     return [self indexWithOptions:0 passingTest:predicate];
 }
 
-
-- (NSUInteger)indexInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(BOOL (^)(NSUInteger idx, BOOL *stop))predicate
+- (NSUInteger)indexWithOptions:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate
 {
     if (predicate == nil)
     {
         [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return NSNotFound;
     }
-    if (IS_EMPTY(self))
-    {
-        return NSNotFound;
-    }
-    if (HAS_SINGLE_RANGE(self))
-    {
-        NSRange intersectRange = NSIntersectionRange(range, SINGLE_RANGE(self));
-        if (intersectRange.length == 0)
-        {
-            return NSNotFound;
-        }
-        return __NSEnumerateIndexSingleIndexRange(intersectRange, options, predicate);
-    }
-    else if (options != 0)
-    {
-        return __NSEnumerateIndexMultipleIndexRangesWithNonZeroOptions(self, &range, options, predicate);
-    }
-    else // multiple ranges, zero options
-    {
-        BOOL stop = NO;
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            if (range.location >= ptr->range.location + ptr->range.length)
-            {
-                continue;
-            }
-            if (ptr->range.location >= range.location + range.length)
-            {
-                break;
-            }
-            NSRange iRange = NSIntersectionRange(range, ptr->range);
-            for (NSUInteger i = iRange.location; i < iRange.location + iRange.length; i++)
-            {
-                if (predicate(i, &stop))
-                {
-                    return i;
-                }
-                if (stop)
-                {
-                    break;
-                }
-            }
-        }
-        return NSNotFound;
-    }
+    return [self _indexInRange:NSMakeRange(0, NSNotFound) options:options passingTest:predicate];
 }
 
-- (NSUInteger)indexWithOptions:(NSEnumerationOptions)options passingTest:(BOOL (^)(NSUInteger idx, BOOL *stop))predicate
+- (NSUInteger)indexInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate
 {
     if (predicate == nil)
     {
         [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return NSNotFound;
     }
-    if (IS_EMPTY(self))
-    {
-        return NSNotFound;
-    }
-    if (HAS_SINGLE_RANGE(self))
-    {
-        return __NSEnumerateIndexSingleIndexRange(SINGLE_RANGE(self), options, predicate);
-    }
-    else if (options != 0)
-    {
-        return __NSEnumerateIndexMultipleIndexRangesWithNonZeroOptions(self, nil, options, predicate);
-    }
-    else // multiple ranges, zero options
-    {
-        BOOL stop = NO;
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            for (NSUInteger i = ptr->range.location; i < ptr->range.location + ptr->range.length; i++)
-            {
-                if (predicate(i, &stop))
-                {
-                    return i;
-                }
-                if (stop)
-                {
-                    break;
-                }
-            }
-        }
-        return NSNotFound;
-    }
+    return [self _indexInRange:range options:options passingTest:predicate];
 }
 
-static NSIndexSet *__NSEnumerateIndexesSingleIndexRange(NSRange range, NSEnumerationOptions options, IndexTest block)
-{
-    __block NSMutableIndexSet *indexSet = [[NSIndexSet indexSet] mutableCopy];
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        dispatch_apply(range.length, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                if (block(iter + range.location, &stop))
-                {
-                    [indexSet addIndex:iter + range.location];
-                }
-            }
-        });
-    }
-    else if (options & NSEnumerationReverse)
-    {
-        BOOL stop = NO;
-        for (NSInteger i = range.location + range.length - 1 ; i >= range.location; i--)
-        {
-            if (block(i, &stop))
-            {
-                [indexSet addIndex:i];
-            }
-            if (stop)
-            {
-                break;
-            }
-        }
-    }
-    else
-    {
-        BOOL stop = NO;
-        for (NSUInteger i = range.location; i < range.location + range.length; i++)
-        {
-            if (block(i, &stop))
-            {
-                [indexSet addIndex:i];
-            }
-            if (stop)
-            {
-                break;
-            }
-        }
-    }
-    return [indexSet autorelease];
-}
-
-static NSIndexSet *__NSEnumerateIndexesMultipleIndexRangesWithNonZeroOptions(NSIndexSet *self, NSRange *range, NSEnumerationOptions options, IndexTest block)
-{
-    NSUInteger count = [self count];
-    if (count == 0)
-    {
-        return [NSIndexSet indexSet];
-    }
-    NSUInteger *indexes = (NSUInteger *)malloc(count * sizeof(NSUInteger));
-    NSUInteger actualCount = [self getIndexes:indexes maxCount:count inIndexRange:range];
-    __block NSMutableIndexSet *indexSet = [[NSIndexSet indexSet] mutableCopy];
-    if (options & NSEnumerationConcurrent)
-    {
-        __block BOOL stop = NO;
-        dispatch_apply(actualCount, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t iter){
-            if (!stop)
-            {
-                if (block(indexes[iter], &stop))
-                {
-                    [indexSet addIndex:indexes[iter]];
-                }
-            }
-        });
-    }
-    else // NSEnumerationReverse
-    {
-        BOOL stop = NO;
-        for (NSInteger i = actualCount - 1; i >= 0; i--)
-        {
-            if (block(indexes[i], &stop))
-            {
-                [indexSet addIndex:indexes[i]];
-            }
-            if (stop)
-            {
-                break;
-            }
-        }
-    }
-    free(indexes);
-    return [indexSet autorelease];
-}
-
-- (NSIndexSet *)indexesPassingTest:(BOOL (^)(NSUInteger idx, BOOL *stop))predicate
+- (NSIndexSet *)indexesPassingTest:(IndexSetPredicateBlock)predicate
 {
     return [self indexesWithOptions:0 passingTest:predicate];
 }
 
-- (NSIndexSet *)indexesInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(BOOL (^)(NSUInteger idx, BOOL *stop))predicate
+- (NSIndexSet *)indexesWithOptions:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate
 {
     if (predicate == nil)
     {
         [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return nil;
     }
-    
-    if (IS_EMPTY(self))
-    {
-        return [NSIndexSet indexSet];
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        NSRange intersectRange = NSIntersectionRange(range, SINGLE_RANGE(self));
-        if (intersectRange.length == 0)
-        {
-            return [NSIndexSet indexSet];
-        }
-        return __NSEnumerateIndexesSingleIndexRange(intersectRange, options, predicate);
-    }
-    else if (options != 0)
-    {
-        return __NSEnumerateIndexesMultipleIndexRangesWithNonZeroOptions(self, &range, options, predicate);
-    }
-    else // multiple ranges, zero options
-    {
-        NSMutableIndexSet *indexSet = [[NSIndexSet indexSet] mutableCopy];
-        BOOL stop = NO;
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            if (range.location >= ptr->range.location + ptr->range.length)
-            {
-                continue;
-            }
-            if (ptr->range.location >= range.location + range.length)
-            {
-                break;
-            }
-            NSRange iRange = NSIntersectionRange(range, ptr->range);
-            for (NSUInteger i = iRange.location; i < iRange.location + iRange.length; i++)
-            {
-                if (predicate(i, &stop))
-                {
-                    [indexSet addIndex:i];
-                }
-                if (stop)
-                {
-                    break;
-                }
-            }
-        }
-        return [indexSet autorelease];
-    }
+    return [self _indexesInRange:NSMakeRange(0, NSNotFound) options:options passingTest:predicate];
 }
 
-- (NSIndexSet *)indexesWithOptions:(NSEnumerationOptions)options passingTest:(BOOL (^)(NSUInteger idx, BOOL *stop))predicate
+- (NSIndexSet *)indexesInRange:(NSRange)range options:(NSEnumerationOptions)options passingTest:(IndexSetPredicateBlock)predicate
 {
     if (predicate == nil)
     {
         [NSException raise:NSInvalidArgumentException format:@"block is nil"];
-        return nil;
     }
-    if (IS_EMPTY(self))
-    {
-        return [NSIndexSet indexSet];
-    }
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        return __NSEnumerateIndexesSingleIndexRange(SINGLE_RANGE(self), options, predicate);
-    }
-    else if (options != 0)
-    {
-        return __NSEnumerateIndexesMultipleIndexRangesWithNonZeroOptions(self, nil, options, predicate);
-    }
-    else // multiple ranges, zero options
-    {
-        NSMutableIndexSet *indexSet = [[NSIndexSet indexSet] mutableCopy];
-        BOOL stop = NO;
-        RangeList *ptr = NULL;
-        DL_FOREACH(MULTIPLE_RANGE_DATA(self), ptr)
-        {
-            for (NSUInteger i = ptr->range.location; i < ptr->range.location + ptr->range.length; i++)
-            {
-                if (predicate(i, &stop))
-                {
-                    [indexSet addIndex:i];
-                }
-                if (stop)
-                {
-                    break;
-                }
-            }
-        }
-        return [indexSet autorelease];
-    }
+    return [self _indexesInRange:range options:options passingTest:predicate];
 }
 
-- (RangeList *)_pointerToRangeBeforeOrContainingIndex:(NSUInteger)index
+- (void)enumerateRangesUsingBlock:(IndexSetRangeBlock)block
 {
-    RangeList *ptr = MULTIPLE_RANGE_DATA(self);
-    if (ptr == NULL)
-    {
-        return NULL;
-    }
-    
-    if (ptr->range.location > index)
-    {
-        return NULL; // insert at beginning
-    }
-    while (ptr->next && ptr->next->range.location <= index)
-    {
-        ptr = ptr->next;
-    }
-    return ptr;
+    [self enumerateRangesWithOptions:0 usingBlock:block];
 }
 
-- (void)_mergeOverlappingRangesStartingAtIndex:(RangeList *)ptr
+- (void)enumerateRangesWithOptions:(NSEnumerationOptions)options usingBlock:(IndexSetRangeBlock)block
 {
-    if (ptr == NULL)
+    if (block == nil)
     {
-        return;
+        [NSException raise:NSInvalidArgumentException format:@"block is nil"];
     }
-    NSUInteger start = ptr->range.location;
-    while (YES)
-    {
-        RangeList *next = ptr->next;
-        if (next)
-        {
-            NSUInteger endAnd1 = start + ptr->range.length;
-            NSUInteger nextStart = next->range.location;
-            if (endAnd1 >= nextStart)
-            {
-                NSUInteger nextEndAnd1 = nextStart + next->range.length;
-                DL_DELETE(MULTIPLE_RANGE_DATA(self), next);
-                ptr->range.length = MAX(endAnd1, nextEndAnd1) - start;
-                free(next);
-                continue;
-            }
-        }
-        break;
-    }
-    if (MULTIPLE_RANGE_DATA(self)->next == NULL)
-    {
-        CLEAR_CACHE(self);
-        SET_HAS_SINGLE_RANGE(self, YES);
-        SET_EMPTY(self, NO);
-        SET_SINGLE_RANGE(self, ptr->range);
-        free(ptr);
-    }
+    [self _enumerateRangesInRange:NSMakeRange(0, NSNotFound) options:options usingBlock:block];
 }
 
-- (void)_setContentToContentFromIndexSet:(NSIndexSet *)other
+- (void)enumerateRangesInRange:(NSRange)range options:(NSEnumerationOptions)options usingBlock:(IndexSetRangeBlock)block
 {
-    if ([other _isEmpty])
+    if (block == nil)
     {
-        return;
+        [NSException raise:NSInvalidArgumentException format:@"block is nil"];
     }
-    
-    SET_EMPTY(self, NO);
-    
-    if ([other _hasSingleRange])
-    {
-        SET_HAS_SINGLE_RANGE(self, YES);
-        SET_SINGLE_RANGE(self, [other _singleRange]);
-        return;
-    }
-
-    for (RangeList *ptr = [other _multipleRangeData]; ptr != NULL; ptr = ptr->next)
-    {
-        RangeList *to = (RangeList *)malloc(sizeof(RangeList));
-        to->range = ptr->range;
-        DL_APPEND(MULTIPLE_RANGE_DATA(self), to);
-    }
+    [self _enumerateRangesInRange:range options:options usingBlock:block];
 }
 
 @end
@@ -1933,333 +1191,139 @@ static NSIndexSet *__NSEnumerateIndexesMultipleIndexRangesWithNonZeroOptions(NSI
 
 - (void)addIndexes:(NSIndexSet *)indexSet
 {
-    if (indexSet == nil || [indexSet _isEmpty])
+    if (indexSet == nil || indexSet == self)
     {
         return;
     }
-    if ([indexSet _hasSingleRange])
+    for (NSUInteger i = 0; i < indexSet->_rangeCount; i++)
     {
-        [self addIndexesInRange:[indexSet _singleRange]];
-    }
-    else
-    {
-        NSUInteger currentIndex = [indexSet firstIndex];
-        while (currentIndex != NSNotFound)
-        {
-            [self addIndex:currentIndex];
-            currentIndex = [indexSet indexGreaterThanIndex:currentIndex];
-        }
+        NSIndexSetAddRange(self, indexSet->_ranges[i]);
     }
 }
 
 - (void)removeIndexes:(NSIndexSet *)indexSet
 {
-    if ([indexSet _isEmpty])
+    if (indexSet == nil || indexSet->_rangeCount == 0)
     {
         return;
     }
-    if ([indexSet _hasSingleRange])
+    if (indexSet == self)
     {
-        [self removeIndexesInRange:[indexSet _singleRange]];
+        [self removeAllIndexes];
+        return;
     }
-    else
+    for (NSUInteger i = 0; i < indexSet->_rangeCount; i++)
     {
-        for (RangeList *ptr = [indexSet _multipleRangeData]; ptr != NULL; ptr = ptr->next)
-        {
-            [self removeIndexesInRange:ptr->range];
-        }
+        NSIndexSetRemoveRange(self, indexSet->_ranges[i]);
     }
 }
 
 - (void)removeAllIndexes
 {
-    if (!IS_EMPTY(self) && !HAS_SINGLE_RANGE(self))
-    {
-        RangeList *ptr = NULL;
-        RangeList *tmp = NULL;
-        
-        DL_FOREACH_SAFE(MULTIPLE_RANGE_DATA(self), ptr, tmp)
-        {
-            free(ptr);
-        }
-    }
-
-    CLEAR_RANGES(self);
+    self->_rangeCount = 0;
+    self->_count = 0;
 }
 
 - (void)addIndex:(NSUInteger)value
 {
-    [self addIndexesInRange:NSMakeRange(value, 1)];
+    NSIndexSetAddRange(self, NSMakeRange(value, 1));
 }
 
 - (void)removeIndex:(NSUInteger)value
 {
-    [self removeIndexesInRange:NSMakeRange(value, 1)];
+    NSIndexSetRemoveRange(self, NSMakeRange(value, 1));
 }
 
 - (void)addIndexesInRange:(NSRange)range
 {
-    addIndexesInRange(self, range);
+    NSIndexSetAddRange(self, range);
 }
 
 - (void)removeIndexesInRange:(NSRange)range
 {
-    if (range.length == 0 || [self _isEmpty])
-    {
-        return;
-    }
-    
-    NSUInteger start = range.location;
-    NSUInteger end = start + range.length - 1;
-    
-    if (HAS_SINGLE_RANGE(self))
-    {
-        if (NSIntersectionRange(SINGLE_RANGE(self), range).length == 0)
-        {
-            return;
-        }
-
-        NSUInteger rangeStart = SINGLE_RANGE(self).location;
-        NSUInteger rangeEnd = rangeStart + SINGLE_RANGE(self).length - 1;
-        
-        if (start <= rangeStart && (end >= rangeEnd))  // remove everything
-        {
-            CLEAR_RANGES(self);
-            return;
-        }
-        else if (start <= rangeStart)
-        {
-            SET_SINGLE_RANGE(self, NSMakeRange(end + 1, rangeEnd - end));
-            return;
-        }
-        else if (end >= rangeEnd)
-        {
-            SET_SINGLE_RANGE(self, NSMakeRange(SINGLE_RANGE(self).location, start - rangeStart));
-            return;
-        }
-        else // Need to split
-        {
-            SET_HAS_SINGLE_RANGE(self, NO);
-            SET_EMPTY(self, NO);
-            // set the cache to NULL so that it does not have junk data from the union
-            RESET_CACHE(self);
-            
-            RangeList *first = (RangeList *)malloc(sizeof(RangeList));
-            first->range.location = rangeStart;
-            first->range.length = start - rangeStart;
-            
-            RangeList *second = (RangeList *)malloc(sizeof(RangeList));
-            second->range.location = end + 1;
-            second->range.length = rangeEnd - end;
-            
-            MULTIPLE_RANGE_DATA(self) = NULL;
-            DL_APPEND(MULTIPLE_RANGE_DATA(self), first);
-            DL_APPEND(MULTIPLE_RANGE_DATA(self), second);
-            return;
-        }
-    }
-    else
-    {
-        CLEAR_CACHE(self);
-        
-        RangeList *tmp;
-        RangeList *ptr = [self _pointerToRangeBeforeOrContainingIndex:start];
-        if (ptr == NULL)
-        {
-            ptr = MULTIPLE_RANGE_DATA(self); // start at beginning
-        }
-        
-        DL_FOREACH_SAFE(ptr, ptr, tmp)
-        {
-            NSUInteger rangeStart = ptr->range.location;
-            NSUInteger rangeEnd = rangeStart + ptr->range.length - 1;
-            if (start > rangeEnd)
-            {
-                continue;
-            }
-            else if (start <= rangeStart && (end >= rangeEnd)) // remove whole range
-            {
-                DL_DELETE(MULTIPLE_RANGE_DATA(self), ptr);
-                free(ptr);
-                continue;
-            }
-            else if (rangeStart > end) // passed relevant ranges
-            {
-                break;
-            }
-            else if (start <= rangeStart)
-            {
-                ptr->range.location = end + 1;
-                ptr->range.length = rangeEnd - end;
-                break;  // Cannot be any more relevant ranges
-            }
-            else if (end >= rangeEnd)
-            {
-                ptr->range.length = start - rangeStart;
-                continue;
-            }
-            else // Need to split
-            {
-                ptr->range.length = start - rangeStart;
-                
-                RangeList *second = (RangeList *)malloc(sizeof(RangeList));
-                second->range.location = end + 1;
-                second->range.length = rangeEnd - end;
-                
-                DL_INSERT(MULTIPLE_RANGE_DATA(self), ptr, second);
-                break;
-            }
-        }
-        
-        [self _mergeOverlappingRangesStartingAtIndex:ptr != NULL ? ptr->prev : MULTIPLE_RANGE_DATA(self)];
-    }
-}
-
-// Shift a range, possibly truncating at 0
-static inline void _shiftRange(NSRange *range, NSInteger delta)
-{
-    if (delta < 0 && -delta > range->location)
-    {
-        if (-delta > NSMaxRange(*range))
-        {
-            range->length = 0;
-        }
-        else
-        {
-            range->length = NSMaxRange(*range) + delta;
-        }
-        range->location = 0;
-    }
-    else
-    {
-        range->location += delta;
-    }
+    NSIndexSetRemoveRange(self, range);
 }
 
 - (void)shiftIndexesStartingAtIndex:(NSUInteger)index by:(NSInteger)delta
 {
-    if (IS_EMPTY(self))
+    if (delta == 0 || self->_rangeCount == 0)
     {
         return;
     }
 
-    if (delta == 0)
+    NSUInteger up = 0;
+    NSUInteger down = 0;
+    if (delta > 0)
     {
-        return;
-    }
-
-    if (HAS_SINGLE_RANGE(self))
-    {
-        // Index past range results in no change
-        if(NSMaxRange(SINGLE_RANGE(self)) <= index)
-        {
-            return;
-        }
-
-        // Overflow
-        if ((delta > 0) && (NSMaxRange(SINGLE_RANGE(self)) > (NSNotFound - delta - 1)))
-        {
-            [NSException raise:NSRangeException format:@"shift would push range past NSNotFound - 1"];
-            return;
-        }
-
-        // Overlapping negative shift results in one range
-        if ((delta < 0) && -delta <= SINGLE_RANGE(self).length)
-        {
-            _shiftRange(&SINGLE_RANGE(self), delta);
-            return;
-        }
-
-        // Index before single range results in one range (or zero if shifted left too far)
-        if (index <= SINGLE_RANGE(self).location)
-        {
-            _shiftRange(&SINGLE_RANGE(self), delta);
-            if (SINGLE_RANGE(self).length == 0)
-            {
-                CLEAR_RANGES(self);
-            }
-            return;
-        }
-
-        // Otherwise, index inside single range splits into two ranges
-        RangeList *firstRange = malloc(sizeof(RangeList));
-        RangeList *secondRange = malloc(sizeof(RangeList));
-
-        NSRange currentRange = SINGLE_RANGE(self);
-
-        CLEAR_CACHE(self);
-        SET_HAS_SINGLE_RANGE(self, NO);
-        MULTIPLE_RANGE_DATA(self) = NULL;
-
-        firstRange->range = NSMakeRange(currentRange.location, index - currentRange.location);
-        secondRange->range = NSMakeRange(index, NSMaxRange(currentRange) - index);
-
-        if (delta > 0)
-        {
-            _shiftRange(&secondRange->range, delta);
-        }
-        else
-        {
-            _shiftRange(&firstRange->range, delta);
-        }
-
-        DL_APPEND(MULTIPLE_RANGE_DATA(self), firstRange);
-        DL_APPEND(MULTIPLE_RANGE_DATA(self), secondRange);
-
-        return;
+        up = (NSUInteger)delta;
     }
     else
     {
-        CLEAR_CACHE(self);
+        // Avoid the undefined negation of NSIntegerMin.
+        down = (NSUInteger)(-(delta + 1)) + 1;
+    }
 
-        RangeList *ptr = [self _pointerToRangeBeforeOrContainingIndex:index];
-        if (ptr == NULL)
-        {
-            ptr = MULTIPLE_RANGE_DATA(self); // start at beginning
-        }
-        if (NSLocationInRange(index, ptr->range) && ptr->range.location != index)
-        {
-            //Break the range up
-            RangeList *second = (RangeList *)malloc(sizeof(RangeList));
-            second->range.location = index;
-            second->range.length = (ptr->range.location + ptr->range.length) - index;
-            second->next = ptr->next;
+    NSIndexSetBuilder builder;
+    builder.ranges = NULL;
+    builder.count = 0;
+    builder.capacity = 0;
 
-            ptr->next = second;
-            ptr->range.length = index - ptr->range.location;
+    for (NSUInteger i = 0; i < self->_rangeCount; i++)
+    {
+        NSRange entry = self->_ranges[i];
+        NSUInteger entryEnd = NSIndexSetRangeEnd(entry);
 
-            ptr = second;
-        }
-        for (; ptr != NULL; ptr = ptr->next)
+        if (up > 0)
         {
-            if(NSMaxRange(ptr->range) <= index)
+            // Indexes below index stay put.
+            NSUInteger keepEnd = MIN(entryEnd, index);
+            if (entry.location < keepEnd)
             {
-                continue;
+                NSIndexSetBuilderAppend(&builder, NSMakeRange(entry.location, keepEnd - entry.location));
             }
-            else if ((delta > 0) && ((ptr->range.location + ptr->range.length) > (NSNotFound - delta - 1)))
+            // Indexes at or above index move up; those that would reach
+            // NSNotFound are dropped.
+            NSUInteger moveStart = MAX(entry.location, index);
+            if (moveStart < entryEnd)
             {
-                [NSException raise:NSRangeException format:@"shift would push range past NSNotFound - 1"];
-                return;
-            }
-            else if ((delta < 0) && (ptr->range.location < -delta))
-            {
-                if (ptr->range.location + ptr->range.length <= -delta)
+                NSUInteger keepLimit = up >= NSNotFound ? moveStart : MIN(entryEnd, NSNotFound - up);
+                if (moveStart < keepLimit)
                 {
-                    [self removeIndexesInRange: NSMakeRange(ptr->range.location, ptr->range.length)];
-                }
-                else
-                {
-                    NSUInteger oldLocation = ptr->range.location;
-                    ptr->range.location = 0;
-                    ptr->range.length += (oldLocation + delta);
+                    NSIndexSetBuilderAppend(&builder, NSMakeRange(moveStart + up, keepLimit - moveStart));
                 }
             }
-            else
+        }
+        else
+        {
+            // Indexes in [index - down, index) are overwritten and removed.
+            NSUInteger limit = index >= down ? index - down : 0;
+            NSUInteger keepEnd = MIN(entryEnd, limit);
+            if (entry.location < keepEnd)
             {
-                ptr->range.location += delta;
+                NSIndexSetBuilderAppend(&builder, NSMakeRange(entry.location, keepEnd - entry.location));
+            }
+            // Indexes at or above index move down; those that would fall
+            // below zero are dropped.
+            NSUInteger moveStart = MAX(entry.location, index);
+            if (moveStart < entryEnd && down < entryEnd)
+            {
+                NSUInteger newLocation = moveStart > down ? moveStart - down : 0;
+                NSIndexSetBuilderAppend(&builder, NSMakeRange(newLocation, entryEnd - down - newLocation));
             }
         }
     }
+
+    NSUInteger newCount = 0;
+    for (NSUInteger i = 0; i < builder.count; i++)
+    {
+        newCount += builder.ranges[i].length;
+    }
+
+    free(self->_ranges);
+    self->_ranges = builder.ranges;
+    self->_rangeCount = builder.count;
+    self->_capacity = builder.capacity;
+    self->_count = newCount;
 }
 
 @end
