@@ -107,6 +107,12 @@ typedef struct offsetDataStruct offsetDataStruct;
 }
 
 + (id)unarchivedObjectOfClass:(Class)cls fromData:(NSData *)data error:(NSError **)error;
++ (id)unarchivedObjectOfClasses:(NSSet *)classes fromData:(NSData *)data error:(NSError **)error;
++ (id)unarchivedArrayOfObjectsOfClass:(Class)cls fromData:(NSData *)data error:(NSError **)error;
++ (id)unarchivedArrayOfObjectsOfClasses:(NSSet *)classes fromData:(NSData *)data error:(NSError **)error;
++ (id)unarchivedDictionaryWithKeysOfClass:(Class)keyClass objectsOfClass:(Class)valueClass fromData:(NSData *)data error:(NSError **)error;
++ (id)unarchivedDictionaryWithKeysOfClasses:(NSSet *)keyClasses objectsOfClasses:(NSSet *)valueClasses fromData:(NSData *)data error:(NSError **)error;
++ (id)unarchiveTopLevelObjectWithData:(NSData *)data error:(NSError **)error;
 + (id)unarchiveObjectWithData:(NSData *)data;
 + (id)unarchiveObjectWithFile:(NSString *)path;
 - (id)initForReadingWithData:(NSData *)data;

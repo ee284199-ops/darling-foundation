@@ -12,6 +12,7 @@
 #import "CFInternal.h"
 #import <Foundation/NSDictionary.h>
 #import <Foundation/NSFileManager.h>
+#import <Foundation/NSError.h>
 #import <Foundation/NSException.h>
 #import <Foundation/NSSet.h>
 #import <Foundation/NSURL.h>
@@ -1061,10 +1062,143 @@ static CFDictionaryValueCallBacks sNSCFDictionaryValueCallBacks = {
     return self;
 }
 
+// NSCoderReadCorruptError
+#define NSKEYEDUNARCHIVER_CORRUPT_ERROR 4864
+
+static NSError *corruptArchiveError(NSString *description)
+{
+    return [NSError errorWithDomain:NSCocoaErrorDomain
+                               code:NSKEYEDUNARCHIVER_CORRUPT_ERROR
+                           userInfo:@{NSDebugDescriptionErrorKey : description}];
+}
+
 - (id)initForReadingFromData:(NSData *)data error:(NSError **)error
 {
-#warning TODO [NSKeyedUnarchiver initForReadingFromData:error:]
-    return [self initForReadingWithData: data];
+    // Unlike macOS, this doesn't turn on requiresSecureCoding: Darling's check only
+    // accepts the exact classes asked for (not subclasses or class cluster members),
+    // which would reject archives that macOS reads fine.
+    @try {
+        self = [self initForReadingWithData:data];
+    } @catch (NSException *exception) {
+        self = nil;
+    }
+    if (self == nil && error != NULL) {
+        *error = corruptArchiveError(@"The data couldn't be read because it isn't in the correct format.");
+    }
+    return self;
+}
+
++ (id)unarchivedObjectOfClasses:(NSSet *)classes fromData:(NSData *)data error:(NSError **)error
+{
+    NSKeyedUnarchiver *unarchiver = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:error];
+    if (unarchiver == nil) {
+        return nil;
+    }
+
+    id object = nil;
+    NSString *failure = nil;
+    @try {
+        object = [[unarchiver decodeObjectForKey:NSKeyedArchiveRootObjectKey] retain];
+        [unarchiver finishDecoding];
+    } @catch (NSException *exception) {
+        failure = [[exception reason] copy];
+    }
+    [unarchiver release];
+
+    if (object != nil && failure == nil && classes != nil) {
+        BOOL allowed = NO;
+        for (Class cls in classes) {
+            if ([object isKindOfClass:cls]) {
+                allowed = YES;
+                break;
+            }
+        }
+        if (!allowed) {
+            failure = [[NSString alloc] initWithFormat:@"value for key 'root' was of unexpected class '%@'", NSStringFromClass([object class])];
+        }
+    }
+
+    if (failure != nil) {
+        if (error != NULL) {
+            *error = corruptArchiveError(failure);
+        }
+        [failure release];
+        [object release];
+        return nil;
+    }
+    return [object autorelease];
+}
+
++ (id)unarchivedObjectOfClass:(Class)cls fromData:(NSData *)data error:(NSError **)error
+{
+    return [self unarchivedObjectOfClasses:[NSSet setWithObject:cls] fromData:data error:error];
+}
+
++ (id)unarchivedArrayOfObjectsOfClasses:(NSSet *)classes fromData:(NSData *)data error:(NSError **)error
+{
+    NSArray *array = [self unarchivedObjectOfClass:[NSArray class] fromData:data error:error];
+    for (id object in array) {
+        BOOL allowed = NO;
+        for (Class cls in classes) {
+            if ([object isKindOfClass:cls]) {
+                allowed = YES;
+                break;
+            }
+        }
+        if (!allowed) {
+            if (error != NULL) {
+                *error = corruptArchiveError([NSString stringWithFormat:@"array element of unexpected class '%@'", NSStringFromClass([object class])]);
+            }
+            return nil;
+        }
+    }
+    return array;
+}
+
++ (id)unarchivedArrayOfObjectsOfClass:(Class)cls fromData:(NSData *)data error:(NSError **)error
+{
+    return [self unarchivedArrayOfObjectsOfClasses:[NSSet setWithObject:cls] fromData:data error:error];
+}
+
++ (id)unarchivedDictionaryWithKeysOfClasses:(NSSet *)keyClasses objectsOfClasses:(NSSet *)valueClasses fromData:(NSData *)data error:(NSError **)error
+{
+    NSDictionary *dictionary = [self unarchivedObjectOfClass:[NSDictionary class] fromData:data error:error];
+    for (id key in dictionary) {
+        id value = [dictionary objectForKey:key];
+        BOOL keyAllowed = NO, valueAllowed = NO;
+        for (Class cls in keyClasses) {
+            if ([key isKindOfClass:cls]) {
+                keyAllowed = YES;
+                break;
+            }
+        }
+        for (Class cls in valueClasses) {
+            if ([value isKindOfClass:cls]) {
+                valueAllowed = YES;
+                break;
+            }
+        }
+        if (!keyAllowed || !valueAllowed) {
+            if (error != NULL) {
+                *error = corruptArchiveError(@"dictionary entry of unexpected class");
+            }
+            return nil;
+        }
+    }
+    return dictionary;
+}
+
++ (id)unarchivedDictionaryWithKeysOfClass:(Class)keyClass objectsOfClass:(Class)valueClass fromData:(NSData *)data error:(NSError **)error
+{
+    return [self unarchivedDictionaryWithKeysOfClasses:[NSSet setWithObject:keyClass]
+                                      objectsOfClasses:[NSSet setWithObject:valueClass]
+                                              fromData:data
+                                                 error:error];
+}
+
++ (id)unarchiveTopLevelObjectWithData:(NSData *)data error:(NSError **)error
+{
+    return [self unarchivedObjectOfClasses:nil fromData:data error:error];
 }
 
 - (id)init
