@@ -354,6 +354,36 @@ SINGLETON_RR()
 
 @end
 
+// Nothing here throttles or sleeps, so an activity is only a token for endActivity:.
+@implementation NSProcessInfo (NSProcessInfoActivity)
+
+- (id <NSObject>)beginActivityWithOptions:(NSActivityOptions)options reason:(NSString *)reason
+{
+    return [[[NSObject alloc] init] autorelease];
+}
+
+- (void)endActivity:(id <NSObject>)activity
+{
+}
+
+- (void)performActivityWithOptions:(NSActivityOptions)options reason:(NSString *)reason usingBlock:(void (^)(void))block
+{
+    id <NSObject> activity = [[self beginActivityWithOptions:options reason:reason] retain];
+
+    block();
+    [self endActivity:activity];
+    [activity release];
+}
+
+- (void)performExpiringActivityWithReason:(NSString *)reason usingBlock:(void (^)(BOOL expired))block
+{
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        block(NO);
+    });
+}
+
+@end
+
 @implementation NSProcessInfo (NSProcessInfoPlatform)
 -(BOOL)isMacCatalystApp {
     return NO;

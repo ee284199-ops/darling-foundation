@@ -1004,6 +1004,44 @@ static NSError *_NSErrorWithFilePathAndErrno(id path, int code)
     return [self moveItemAtPath:srcURL.path toPath:dstURL.path error:error];
 }
 
+- (BOOL)trashItemAtURL:(NSURL *)url resultingItemURL:(NSURL **)outResultingURL error:(NSError **)error
+{
+    NSString *path = [url path];
+    NSString *trash = [NSHomeDirectory() stringByAppendingPathComponent:@".Trash"];
+    NSString *name = [path lastPathComponent];
+    NSString *destination;
+    NSUInteger attempt;
+
+    if (path == nil || name == nil)
+    {
+        if (error != NULL)
+            *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
+        return NO;
+    }
+
+    if (![self createDirectoryAtPath:trash withIntermediateDirectories:YES attributes:nil error:error])
+        return NO;
+
+    // "name", then "name 2", "name 3", ... as the Finder does
+    destination = [trash stringByAppendingPathComponent:name];
+    for (attempt = 2; [self fileExistsAtPath:destination]; attempt++)
+    {
+        NSString *extension = [name pathExtension];
+        NSString *base = [name stringByDeletingPathExtension];
+        NSString *candidate = [NSString stringWithFormat:@"%@ %lu", base, (unsigned long)attempt];
+
+        if ([extension length] > 0)
+            candidate = [candidate stringByAppendingPathExtension:extension];
+        destination = [trash stringByAppendingPathComponent:candidate];
+    }
+
+    if (![self moveItemAtPath:path toPath:destination error:error])
+        return NO;
+    if (outResultingURL != NULL)
+        *outResultingURL = [NSURL fileURLWithPath:destination];
+    return YES;
+}
+
 - (NSDirectoryEnumerator *)enumeratorAtPath:(NSString *)path
 {
     return [[NSAllDescendantPathsEnumerator newWithPath:path prepend:nil attributes:nil cross:YES depth:1] autorelease];
