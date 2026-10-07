@@ -9,7 +9,7 @@ typedef NS_ENUM(NSUInteger, NSLocaleLanguageDirection) {
     NSLocaleLanguageDirectionBottomToTop = kCFLocaleLanguageDirectionBottomToTop
 };
 
-@class NSArray, NSDictionary, NSString;
+@class NSArray, NSCharacterSet, NSDictionary, NSString;
 
 FOUNDATION_EXPORT NSString * const NSCurrentLocaleDidChangeNotification;
 FOUNDATION_EXPORT NSString * const NSLocaleIdentifier;
@@ -54,6 +54,33 @@ FOUNDATION_EXPORT NSString * const NSISO8601Calendar;
 
 - (NSString *)localeIdentifier;
 - (NSString *)languageCode;
+- (NSString *)countryCode;
+- (NSString *)regionCode;
+- (NSString *)scriptCode;
+- (NSString *)variantCode;
+- (NSCharacterSet *)exemplarCharacterSet;
+- (NSString *)calendarIdentifier;
+- (NSString *)collationIdentifier;
+- (BOOL)usesMetricSystem;
+- (NSString *)decimalSeparator;
+- (NSString *)groupingSeparator;
+- (NSString *)currencySymbol;
+- (NSString *)currencyCode;
+- (NSString *)collatorIdentifier;
+- (NSString *)quotationBeginDelimiter;
+- (NSString *)quotationEndDelimiter;
+- (NSString *)alternateQuotationBeginDelimiter;
+- (NSString *)alternateQuotationEndDelimiter;
+
+- (NSString *)localizedStringForLocaleIdentifier:(NSString *)localeIdentifier;
+- (NSString *)localizedStringForLanguageCode:(NSString *)languageCode;
+- (NSString *)localizedStringForCountryCode:(NSString *)countryCode;
+- (NSString *)localizedStringForScriptCode:(NSString *)scriptCode;
+- (NSString *)localizedStringForVariantCode:(NSString *)variantCode;
+- (NSString *)localizedStringForCalendarIdentifier:(NSString *)calendarIdentifier;
+- (NSString *)localizedStringForCollationIdentifier:(NSString *)collationIdentifier;
+- (NSString *)localizedStringForCurrencyCode:(NSString *)currencyCode;
+- (NSString *)localizedStringForCollatorIdentifier:(NSString *)collatorIdentifier;
 
 @end
 
