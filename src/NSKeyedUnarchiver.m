@@ -184,6 +184,44 @@ static int64_t _getInt(uint8_t **ptrptr)
     return 0;
 }
 
+// Reads a boolean, integer or real at ptr. Like Apple's, decodeBool/Int/Double accept any of
+// them: Interface Builder archives some flags as numbers.
+static BOOL _getScalar(uint8_t *ptr, int64_t *intValue, double *realValue)
+{
+    uint8_t marker = *ptr;
+
+    if (marker == kCFBinaryPlistMarkerTrue || marker == kCFBinaryPlistMarkerFalse)
+    {
+        *intValue = marker == kCFBinaryPlistMarkerTrue;
+        *realValue = *intValue;
+        return YES;
+    }
+    if ((marker & 0xF0) == kCFBinaryPlistMarkerInt && (marker & 0x0F) <= 3)
+    {
+        uint8_t *cursor = ptr;
+        *intValue = _getInt(&cursor);
+        *realValue = (double)*intValue;
+        return YES;
+    }
+    if (marker == kCFBinaryPlistMarkerReal + 3)
+    {
+        CFSwappedFloat64 swapped64;
+        memmove(&swapped64, ptr + 1, 8);
+        *realValue = CFConvertFloat64SwappedToHost(swapped64);
+        *intValue = (int64_t)*realValue;
+        return YES;
+    }
+    if (marker == kCFBinaryPlistMarkerReal + 2)
+    {
+        CFSwappedFloat32 swapped32;
+        memmove(&swapped32, ptr + 1, 4);
+        *realValue = CFConvertFloat32SwappedToHost(swapped32);
+        *intValue = (int64_t)*realValue;
+        return YES;
+    }
+    return NO;
+}
+
 static BOOL _getOffsetForNestedValueWrap(NSKeyedUnarchiver *unarchiver, NSString *key, uint64_t offset, uint64_t *offsetPtr)
 {
     return __CFBinaryPlistGetOffsetForValueFromDictionary3(unarchiver->_bytes, unarchiver->_len, offset, 
@@ -242,7 +280,14 @@ static int64_t _decodeInt(NSKeyedUnarchiver *unarchiver, NSString *key)
         return 0; // Does not distinguish failure from return 0 !
     }
     uint8_t *ptr = (uint8_t *)(unarchiver->_bytes + voffset);
-    return _getInt(&ptr);
+    int64_t intValue;
+    double realValue;
+    if (!_getScalar(ptr, &intValue, &realValue))
+    {
+        [NSException raise:NSInvalidUnarchiveOperationException format:@"Did not find number for key %@", key];
+        return 0;
+    }
+    return intValue;
 }
 
 
@@ -255,6 +300,12 @@ static BOOL _decodeBool(NSKeyedUnarchiver *unarchiver, NSString *key)
         if (val == nil)
         {
             return NO;
+        }
+        if (CFGetTypeID(val) == CFNumberGetTypeID())
+        {
+            double number = 0;
+            CFNumberGetValue((CFNumberRef)val, kCFNumberDoubleType, &number);
+            return number != 0;
         }
         if (CFGetTypeID(val) != CFBooleanGetTypeID())
         {
@@ -269,17 +320,14 @@ static BOOL _decodeBool(NSKeyedUnarchiver *unarchiver, NSString *key)
     {
         return NO; // Does not distinguish failure from return NO !
     }
-    uint8_t encodedVal = *(uint8_t *)(unarchiver->_bytes + voffset);
-    if (encodedVal == kCFBinaryPlistMarkerTrue)
+    int64_t intValue;
+    double realValue;
+    if (!_getScalar((uint8_t *)(unarchiver->_bytes + voffset), &intValue, &realValue))
     {
-        return YES;
-    }
-    else if (encodedVal == kCFBinaryPlistMarkerFalse)
-    {
+        [NSException raise:NSInvalidUnarchiveOperationException format:@"Did not find bool value for key %@", key];
         return NO;
     }
-    DEBUG_BREAK();  // Should never get here
-    return NO;
+    return realValue != 0;
 }
 
 static double _decodeDouble(NSKeyedUnarchiver *unarchiver, NSString *key)
@@ -314,21 +362,14 @@ static double _decodeDouble(NSKeyedUnarchiver *unarchiver, NSString *key)
     {
         return 0.0; // Does not distinguish failure from return NO !
     }
-    uint8_t *ptr = (uint8_t *)(unarchiver->_bytes + voffset);
-    if (*ptr == kCFBinaryPlistMarkerReal + 3) // 8 byte float encoding
+    int64_t intValue;
+    double realValue;
+    if (!_getScalar((uint8_t *)(unarchiver->_bytes + voffset), &intValue, &realValue))
     {
-        CFSwappedFloat64 swapped64;
-        memmove(&swapped64, ptr + 1, 8);
-        return CFConvertFloat64SwappedToHost(swapped64);
+        [NSException raise:NSInvalidUnarchiveOperationException format:@"Did not find number for key %@", key];
+        return 0.0;
     }
-    if (*ptr == kCFBinaryPlistMarkerReal + 2) // 4 byte float encoding
-    {
-        CFSwappedFloat32 swapped32;
-        memmove(&swapped32, ptr + 1, 4);
-        return (double)CFConvertFloat32SwappedToHost(swapped32);
-    }
-    DEBUG_BREAK(); // Should never get here
-    return 0.0;
+    return realValue;
 }
 
 static const uint8_t *_decodeBytes(NSKeyedUnarchiver *unarchiver, NSString * key, NSUInteger *lenPtr)
