@@ -650,14 +650,34 @@ SINGLETON_RR()
 
 + (const NSStringEncoding *)availableStringEncodings
 {
-#warning TODO https://code.google.com/p/apportable/issues/detail?id=269
-    return nil;
+    static NSStringEncoding *encodings = NULL;
+
+    if (encodings == NULL)
+    {
+        const CFStringEncoding *cfEncodings = CFStringGetListOfAvailableEncodings();
+        NSUInteger count = 0, i, n = 0;
+
+        while (cfEncodings[count] != kCFStringEncodingInvalidId)
+            count++;
+
+        NSStringEncoding *list = malloc(sizeof(NSStringEncoding) * (count + 1));
+        for (i = 0; i < count; i++)
+        {
+            NSStringEncoding encoding = CFStringConvertEncodingToNSStringEncoding(cfEncodings[i]);
+            if (encoding != kCFStringEncodingInvalidId)
+                list[n++] = encoding;
+        }
+        // zero-terminated
+        list[n] = 0;
+        encodings = list;
+    }
+    return encodings;
 }
 
 + (NSString *)localizedNameOfStringEncoding:(NSStringEncoding)encoding
 {
-#warning TODO https://code.google.com/p/apportable/issues/detail?id=269
-    return nil;
+    CFStringRef name = CFStringGetNameOfEncoding(CFStringConvertNSStringEncodingToEncoding(encoding));
+    return name ? (NSString *)name : @"";
 }
 
 + (id)string
@@ -691,8 +711,11 @@ SINGLETON_RR()
 
 + (id)localizedStringWithFormat:(NSString *)format, ...
 {
-#warning TODO https://code.google.com/p/apportable/issues/detail?id=269
-    return nil;
+    va_list args;
+    va_start(args, format);
+    NSString *str = [[self alloc] initWithFormat:format locale:[NSLocale currentLocale] arguments:args];
+    va_end(args);
+    return [str autorelease];
 }
 
 + (id)stringWithCString:(const char *)cString encoding:(NSStringEncoding)enc
