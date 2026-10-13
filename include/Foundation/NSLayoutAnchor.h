@@ -18,9 +18,56 @@
 */
 
 #import <Foundation/Foundation.h>
+#import <Foundation/NSLayoutConstraint.h>
 
-@interface NSLayoutAnchor : NSObject
+// An attribute of a view or layout guide that constraints can relate.
+@interface NSLayoutAnchor : NSObject <NSCopying> {
+    id _item;
+    NSLayoutAttribute _attribute;
+}
+
+// for AppKit, which hands these out
++ (instancetype) _anchorWithItem: (id) item attribute: (NSLayoutAttribute) attribute;
+
+- (id) item;
+- (NSLayoutAttribute) _attribute;
+- (NSString *) name;
+- (BOOL) hasAmbiguousLayout;
+- (NSArray *) constraintsAffectingLayout;
+
+- (NSLayoutConstraint *) constraintEqualToAnchor: (NSLayoutAnchor *) anchor;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToAnchor: (NSLayoutAnchor *) anchor;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToAnchor: (NSLayoutAnchor *) anchor;
+- (NSLayoutConstraint *) constraintEqualToAnchor: (NSLayoutAnchor *) anchor constant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToAnchor: (NSLayoutAnchor *) anchor constant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToAnchor: (NSLayoutAnchor *) anchor constant: (CGFloat) c;
+
+@end
+
+@class NSLayoutDimension;
+
+@interface NSLayoutXAxisAnchor : NSLayoutAnchor
+- (NSLayoutDimension *) anchorWithOffsetToAnchor: (NSLayoutXAxisAnchor *) otherAnchor;
+- (NSLayoutConstraint *) constraintEqualToSystemSpacingAfterAnchor: (NSLayoutXAxisAnchor *) anchor multiplier: (CGFloat) multiplier;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToSystemSpacingAfterAnchor: (NSLayoutXAxisAnchor *) anchor multiplier: (CGFloat) multiplier;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToSystemSpacingAfterAnchor: (NSLayoutXAxisAnchor *) anchor multiplier: (CGFloat) multiplier;
+@end
+
+@interface NSLayoutYAxisAnchor : NSLayoutAnchor
+- (NSLayoutDimension *) anchorWithOffsetToAnchor: (NSLayoutYAxisAnchor *) otherAnchor;
+- (NSLayoutConstraint *) constraintEqualToSystemSpacingBelowAnchor: (NSLayoutYAxisAnchor *) anchor multiplier: (CGFloat) multiplier;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToSystemSpacingBelowAnchor: (NSLayoutYAxisAnchor *) anchor multiplier: (CGFloat) multiplier;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToSystemSpacingBelowAnchor: (NSLayoutYAxisAnchor *) anchor multiplier: (CGFloat) multiplier;
 @end
 
 @interface NSLayoutDimension : NSLayoutAnchor
+- (NSLayoutConstraint *) constraintEqualToConstant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToConstant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToConstant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintEqualToAnchor: (NSLayoutDimension *) anchor multiplier: (CGFloat) m;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToAnchor: (NSLayoutDimension *) anchor multiplier: (CGFloat) m;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToAnchor: (NSLayoutDimension *) anchor multiplier: (CGFloat) m;
+- (NSLayoutConstraint *) constraintEqualToAnchor: (NSLayoutDimension *) anchor multiplier: (CGFloat) m constant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintGreaterThanOrEqualToAnchor: (NSLayoutDimension *) anchor multiplier: (CGFloat) m constant: (CGFloat) c;
+- (NSLayoutConstraint *) constraintLessThanOrEqualToAnchor: (NSLayoutDimension *) anchor multiplier: (CGFloat) m constant: (CGFloat) c;
 @end
