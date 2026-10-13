@@ -30,6 +30,9 @@ typedef NS_ENUM(NSUInteger, NSDateFormatterBehavior) {
 - (id)init;
 - (BOOL)getObjectValue:(out id *)obj forString:(NSString *)string range:(inout NSRange *)rangep error:(out NSError **)error;
 - (NSString *)stringFromDate:(NSDate *)date;
+- (void)setLocalizedDateFormatFromTemplate:(NSString *)dateFormatTemplate;
+- (NSFormattingContext)formattingContext;
+- (void)setFormattingContext:(NSFormattingContext)context;
 - (NSDate *)dateFromString:(NSString *)string;
 - (NSDateFormatterStyle)dateStyle;
 - (void)setDateStyle:(NSDateFormatterStyle)style;

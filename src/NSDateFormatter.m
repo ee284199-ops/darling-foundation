@@ -5,6 +5,7 @@
 //  Copyright (c) 2014 Apportable. All rights reserved.
 //
 
+#import <Foundation/FoundationErrors.h>
 #import <Foundation/NSDateFormatter.h>
 #import <Foundation/NSDictionary.h>
 #import <Foundation/NSError.h>
@@ -75,13 +76,75 @@ static NSDateFormatterBehavior defaultBehavior = NSDateFormatterBehaviorDefault;
 - (BOOL)getObjectValue:(out id *)obj forString:(NSString *)string errorDescription:(out NSString **)error
 {
     NSError *err = nil;
-    NSRange r;
+    NSRange r = NSMakeRange(0, [string length]);
     BOOL success = [self getObjectValue:obj forString:string range:&r error:&err];
     if (error != NULL)
     {
         *error= [err localizedDescription];
     }
     return success;
+}
+
+- (BOOL)getObjectValue:(out id *)obj forString:(NSString *)string range:(inout NSRange *)rangep error:(out NSError **)error
+{
+    NSUInteger length = [string length];
+    NSRange range = rangep ? *rangep : NSMakeRange(0, length);
+    CFAbsoluteTime time;
+
+    [self _regenerateFormatter];
+
+    if (range.location > length)
+        range = NSMakeRange(0, length);
+    if (range.length > length - range.location)
+        range.length = length - range.location;
+
+    CFRange cfRange = CFRangeMake(range.location, range.length);
+    if (string == nil || _formatter == NULL ||
+        !CFDateFormatterGetAbsoluteTimeFromString(_formatter, (CFStringRef)string, &cfRange, &time))
+    {
+        if (obj != NULL)
+            *obj = nil;
+        if (error != NULL)
+        {
+            NSString *description = [NSString stringWithFormat:@"The value \"%@\" is invalid.", string];
+            *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFormattingError
+                                     userInfo:[NSDictionary dictionaryWithObject:description forKey:NSLocalizedDescriptionKey]];
+        }
+        return NO;
+    }
+
+    if (obj != NULL)
+        *obj = [NSDate dateWithTimeIntervalSinceReferenceDate:time];
+    if (rangep != NULL)
+        *rangep = NSMakeRange(cfRange.location, cfRange.length);
+    return YES;
+}
+
+- (NSString *)stringForObjectValue:(id)obj
+{
+    if (![obj isKindOfClass:[NSDate class]])
+        return nil;
+    return [self stringFromDate:obj];
+}
+
+- (NSString *)editingStringForObjectValue:(id)obj
+{
+    return [self stringForObjectValue:obj];
+}
+
+- (void)setLocalizedDateFormatFromTemplate:(NSString *)dateFormatTemplate
+{
+    NSString *format = [NSDateFormatter dateFormatFromTemplate:dateFormatTemplate options:0 locale:[self locale]];
+    [self setDateFormat:format ?: dateFormatTemplate];
+}
+
+- (NSFormattingContext)formattingContext
+{
+    return NSFormattingContextUnknown;
+}
+
+- (void)setFormattingContext:(NSFormattingContext)context
+{
 }
 
 - (NSString *)stringFromDate:(NSDate *)date
